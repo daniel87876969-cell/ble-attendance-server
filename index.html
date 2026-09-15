@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>藍牙點名系統 - 後端整合測試面板</title>
+    <style>
+        body { font-family: "Microsoft JhengHei", Arial, sans-serif; background-color: #f4f6f9; padding: 20px; display: flex; flex-direction: column; align-items: center; }
+        h1 { color: #333; margin-bottom: 5px; }
+        .subtitle { color: #666; margin-bottom: 25px; font-weight: bold; }
+        .panel-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 20px; width: 100%; max-width: 1200px; }
+        .card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); box-sizing: border-box; }
+        .card h2 { margin-top: 0; color: #444; border-bottom: 2px solid #eee; padding-bottom: 10px; font-size: 19px; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; color: #666; font-size: 14px; }
+        input { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; font-size: 14px; }
+        button { width: 100%; padding: 12px; border: none; border-radius: 6px; cursor: pointer; font-size: 15px; font-weight: bold; margin-top: 10px; transition: 0.2s; }
+        button:hover { opacity: 0.9; }
+        .btn-send { background-color: #007bff; color: white; }
+        .btn-register { background-color: #28a745; color: white; }
+        .btn-login { background-color: #6c757d; color: white; }
+        .btn-teacher { background-color: #e83e8c; color: white; }
+        .btn-student { background-color: #17a2b8; color: white; }
+        .btn-disabled { background-color: #ccc; cursor: not-allowed; }
+        
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 14px; }
+        th, td { border: 1px solid #dee2e6; padding: 10px; text-align: center; }
+        th { background-color: #f8f9fa; color: #495057; }
+        .status-present { color: #28a745; font-weight: bold; }
+        .status-absent { color: #dc3545; font-weight: bold; }
+
+        .device-sync { background: #eef1f6; padding: 8px; border-radius: 6px; font-size: 12px; font-family: monospace; color: #555; text-align: center; font-weight: bold; }
+        .result-box { margin-top: 15px; padding: 12px; border-radius: 6px; font-size: 13px; font-family: monospace; display: none; max-height: 160px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+        .success-box { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .error-box { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+    </style>
+</head>
+<body>
+
+<h1>📡 藍牙防作弊點名系統</h1>
+<div class="subtitle">期末專案 Demo - 5 人模擬課堂即時監控</div>
+
+<div class="panel-grid">
+
+    <!-- 1. 學生註冊卡片 -->
+    <div class="card">
+        <h2>1. 模擬 App 學生註冊 (防重複)</h2>
+        <div class="form-group">
+            <label>學號 / 帳號</label>
+            <input type="text" id="reg_user_id" placeholder="例如: 12360305" oninput="syncEmailAndId()">
+        </div>
+        <div class="form-group">
+            <label>學生姓名</label>
+            <input type="text" id="reg_name" placeholder="請輸入姓名">
+        </div>
+        <div class="form-group">
+            <label>設定密碼 (長度 >= 4)</label>
+            <input type="password" id="reg_password" value="123456" placeholder="請設定登入密碼">
+        </div>
+        <div class="form-group">
+            <label>電子郵件 (輸入學號自動生成)</label>
+            <input type="email" id="reg_email" placeholder="自動補全為 學號@me.mcu.edu.tw">
+        </div>
+        <button class="btn-send" id="sendBtn" onclick="sendCode()">發送註冊驗證碼</button>
+        
+        <div class="form-group" style="margin-top: 15px;">
+            <label>確認驗證碼</label>
+            <input type="text" id="reg_code" placeholder="輸入信箱收到的 6 位數代碼">
+        </div>
+        <div class="form-group">
+            <label>虛擬手機裝置 ID</label>
+            <div class="device-sync" id="shared_device_id">載入中...</div>
+        </div>
+        <button class="btn-register" onclick="register()">驗證並完成註冊</button>
+        <div id="reg_result" class="result-box"></div>
+    </div>
+
+    <!-- 2. 教師端控制卡片 (含 5 人名單即時表格) -->
+    <div class="card" style="grid-row: span 2;">
+        <h2>2. 模擬 教師端點名與名單看板</h2>
+        <div class="form-group">
+            <label>教師登入 Email</label>
+            <input type="email" id="teacher_email" value="teacher@mcu.edu.tw">
+        </div>
+        <div class="form-group">
+            <label>模擬課程</label>
+            <div class="device-sync" style="background-color: #fff3cd; color: #856404; font-size: 14px;">行動應用與物聯網專案實作 (MCU_BLE_PROJECT)</div>
+        </div>
+        <button class="btn-teacher" onclick="startSession()">📢 啟動全班點名與生成 OTP</button>
+        <button class="btn-login" style="background-color: #e67e22;" onclick="getTeacherOtpList()">🔄 展開 5 人原始 OTP 對照表</button>
+        <div id="teacher_result" class="result-box"></div>
+
+        <h3 style="margin-top: 25px; color: #444; font-size: 16px;">📊 5 人組員即時出席狀態表</h3>
+        <button class="btn-send" style="background-color: #28a745; margin-bottom: 10px;" onclick="refreshAttendanceTable()">🔄 刷新出席狀態表格</button>
+        <table>
+            <thead>
+                <tr>
+                    <th>學號</th>
+                    <th>姓名</th>
+                    <th>課程</th>
+                    <th>出席結果</th>
+                </tr>
+            </thead>
+            <tbody id="attendance_table_body">
+                <tr><td colspan="4" style="color: #888;">載入中...</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <!-- 3. 學生登入卡片 -->
+    <div class="card">
+        <h2>3. 模擬 App 學生登入</h2>
+        <div class="form-group">
+            <label>學號</label>
+            <input type="text" id="login_user_id" placeholder="例如: 12360305" oninput="syncLoginEmail()">
+        </div>
+        <div class="form-group">
+            <label>電子郵件 (Email)</label>
+            <input type="email" id="login_email" placeholder="學號@me.mcu.edu.tw">
+        </div>
+        <div class="form-group">
+            <label>密碼</label>
+            <input type="password" id="login_password" value="123456">
+        </div>
+        <div class="form-group">
+            <label>目前裝置 ID</label>
+            <div class="device-sync" id="login_device_label"></div>
+        </div>
+        <button class="btn-login" onclick="login()">安全登入驗證</button>
+        <div id="login_result" class="result-box"></div>
+    </div>
+
+    <!-- 4. 學生端刷新領取密鑰卡片 -->
+    <div class="card">
+        <h2>4. 模擬 學生端搶當次 OTP</h2>
+        <div class="form-group">
+            <label>學號</label>
+            <input type="text" id="stu_user_id" placeholder="例如: 12360305">
+        </div>
+        <button class="btn-student" onclick="getStudentToken()">📱 手動刷新領取當次藍牙 OTP</button>
+        <div id="student_result" class="result-box"></div>
+    </div>
+
+</div>
+
+<script>
+    const API_URL = '/api';
+    let globalDeviceID = "";
+
+    window.onload = function() {
+        globalDeviceID = "MOCK_UUID_" + Math.random().toString(36).substr(2, 9).toUpperCase();
+        document.getElementById('shared_device_id').innerText = globalDeviceID;
+        document.getElementById('login_device_label').innerText = globalDeviceID;
+        refreshAttendanceTable();
+    };
+
+    function syncEmailAndId() {
+        const userId = document.getElementById('reg_user_id').value.trim();
+        const emailInput = document.getElementById('reg_email');
+        if (userId && !isNaN(userId)) {
+            emailInput.value = `${userId}@me.mcu.edu.tw`;
+        } else {
+            emailInput.value = userId;
+        }
+    }
+
+    function syncLoginEmail() {
+        const userId = document.getElementById('login_user_id').value.trim();
+        const emailInput = document.getElementById('login_email');
+        if (userId && !isNaN(userId)) {
+            emailInput.value = `${userId}@me.mcu.edu.tw`;
+        } else {
+            emailInput.value = userId;
+        }
+    }
+
+    function showStatus(elementId, message, isSuccess) {
+        const el = document.getElementById(elementId);
+        el.style.display = 'block';
+        el.className = `result-box ${isSuccess ? 'success-box' : 'error-box'}`;
+        el.innerText = typeof message === 'object' ? JSON.stringify(message, null, 2) : message;
+    }
+
+    async function sendCode() {
+        syncEmailAndId();
+        const email = document.getElementById('reg_email').value;
+        const btn = document.getElementById('sendBtn');
+        if(!email) return alert("請輸入學號或 Email");
+
+        btn.innerText = "發送中...";
+        btn.disabled = true;
+
+        try {
+            const res = await fetch(`${API_URL}/send-code`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email })
+            });
+            const data = await res.json();
+            if (res.ok) {
+                showStatus('reg_result', "✅ 驗證碼發送成功！請檢查信箱。", true);
+            } else {
+                throw new Error(data.message);
+            }
+        } catch (err) {
+            showStatus('reg_result', "❌ 失敗: " + err.message, false);
+        } finally {
+            btn.disabled = false;
+            btn.innerText = "發送註冊驗證碼";
+        }
+    }
+
+    async function register() {
+        syncEmailAndId();
+        const payload = {
+            user_id: document.getElementById('reg_user_id').value,
+            name: document.getElementById('reg_name').value,
+            password: document.getElementById('reg_password').value,
+            email: document.getElementById('reg_email').value,
+            code: document.getElementById('reg_code').value,
+            device_id: globalDeviceID
+        };
+
+        if(!payload.user_id || !payload.password || !payload.code) return alert("請填滿註冊必填欄位");
+
+        try {
+            const res = await fetch(`${API_URL}/register`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const data = await res.json();
+            if (res.ok) {
+                showStatus('reg_result', "🎉 註冊成功！帳號已鎖定此裝置碼。", true);
+                document.getElementById('login_user_id').value = payload.user_id;
+                document.getElementById('login_email').value = payload.email;
+                document.getElementById('stu_user_id').value = payload.user_id;
+            } else {
+                showStatus('reg_result', "❌ 註冊遭阻擋: " + data.message, false);
+            }
+        } catch (err) {
+            showStatus('reg_result', "❌ 錯誤: " + err.message, false);
+        }
+    }
+
+    async function login() {
+        syncLoginEmail();
+        const payload = {
+            email: document.getElementById('login_email').value,
+            password: document.getElementById('login_password').value,
+            device_id: globalDeviceID
+        };
+
+        try {
+            const res = await fetch(`${API_URL}/auth/login`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const data = await res.json();
+            if (res.ok) {
+                showStatus('login_result', "✅ 登入驗證成功！裝置ID比對無誤 (Status: Success)", true);
+            } else {
+                showStatus('login_result', "❌ 登入失敗: " + data.message, false);
+            }
+        } catch (err) {
+            showStatus('login_result', "❌ 連線錯誤: " + err.message, false);
+        }
+    }
+
+    async function startSession() {
+        const email = document.getElementById('teacher_email').value;
+
+        try {
+            const res = await fetch(`${API_URL}/session/start`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email })
+            });
+            const data = await res.json();
+            if (res.ok) {
+                showStatus('teacher_result', `📢 點名程序已發起！\n課程：${data.course_name}\n當次共用金鑰 XOR Key: ${data.xor_key}\n\n已在後端為 5 位專案組員產生當次 OTP。`, true);
+            } else {
+                showStatus('teacher_result', "❌ 啟動失敗: " + data.message, false);
+            }
+        } catch (err) {
+            showStatus('teacher_result', "❌ 連線錯誤: " + err.message, false);
+        }
+    }
+
+    async function getTeacherOtpList() {
+        const email = document.getElementById('teacher_email').value;
+
+        try {
+            const res = await fetch(`${API_URL}/session/otp-list`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email })
+            });
+            const data = await res.json();
+            if (res.ok) {
+                showStatus('teacher_result', `📋 課程【${data.course_name}】5人原始 OTP 明細：\n${JSON.stringify(data.otp_list, null, 2)}`, true);
+            } else {
+                showStatus('teacher_result', "❌ 獲取失敗: " + data.message, false);
+            }
+        } catch (err) {
+            showStatus('teacher_result', "❌ 連線錯誤: " + err.message, false);
+        }
+    }
+
+    async function getStudentToken() {
+        const student_id = document.getElementById('stu_user_id').value;
+        if(!student_id) return alert("請輸入測試學號");
+
+        try {
+            const res = await fetch(`${API_URL}/session/get-token`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ student_id })
+            });
+            const data = await res.json();
+            if (res.ok) {
+                showStatus('student_result', `🔓 成功拿到動態權杖：\n\n專屬動態密碼 (otp): ${data.otp}\n全班共用密鑰 (xor_key): ${data.xor_key}`, true);
+            } else {
+                showStatus('student_result', "❌ 獲取失敗: " + data.message, false);
+            }
+        } catch (err) {
+            showStatus('student_result', "❌ 連線錯誤: " + err.message, false);
+        }
+    }
+
+    async function refreshAttendanceTable() {
+        try {
+            const res = await fetch(`${API_URL}/session/attendance-status`);
+            const data = await res.json();
+            
+            const tbody = document.getElementById('attendance_table_body');
+            tbody.innerHTML = "";
+            
+            data.forEach(student => {
+                const tr = document.createElement('tr');
+                
+                const tdId = document.createElement('td');
+                tdId.innerText = student.id;
+                
+                const tdName = document.createElement('td');
+                tdName.innerText = student.name;
+
+                const tdCourse = document.createElement('td');
+                tdCourse.innerText = student.course_name || "專案實作";
+                
+                const tdStatus = document.createElement('td');
+                tdStatus.innerText = student.status;
+                tdStatus.className = student.status.includes("✅") ? "status-present" : "status-absent";
+                
+                tr.appendChild(tdId);
+                tr.appendChild(tdName);
+                tr.appendChild(tdCourse);
+                tr.appendChild(tdStatus);
+                tbody.appendChild(tr);
+            });
+        } catch (err) {
+            console.error("無法刷新表格:", err);
+        }
+    }
+</script>
+
+</body>
+</html>
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+      
