@@ -3,6 +3,8 @@ const mysql = require('mysql2');
 const nodemailer = require('nodemailer');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const crypto = require('crypto');
+const http = require('http');
 
 const app = express();
 app.use(cors());
@@ -14,7 +16,7 @@ app.get('/', (req, res) => {
 });
 
 // ==========================================
-// 身分判斷輔助函式
+// 身分判斷與安全輔助函式
 // ==========================================
 function getRoleByEmail(email) {
     if (!email) return 'student';
@@ -23,6 +25,11 @@ function getRoleByEmail(email) {
         return 'teacher';
     }
     return 'student';
+}
+
+// 產生不可預測的隨機 16 碼 session_id (例如 9f3c1a7e4b2d4c8f)
+function generateSecureSessionId() {
+    return crypto.randomBytes(8).toString('hex');
 }
 
 // 預設 5 人固定模擬課程名單 (用於自動初始化資料庫與相容)
@@ -35,7 +42,7 @@ const DEFAULT_STUDENTS = [
 ];
 
 // ==========================================
-// 1. 設定區域 (資料庫、郵件、Session 與定時器隔離池)
+// 1. 設定區域 (資料庫、Session、座標暫存 Buffer)
 // ==========================================
 const db = mysql.createConnection({
     host: 'localhost',
@@ -44,11 +51,15 @@ const db = mysql.createConnection({
     database: 'ble_mcu'
 });
 
-// 以 course_id 為 Key 的動態點名 Sessions
+// 以 course_id, email, session_id 為索引的動態點名 Sessions
 let activeCourseSessions = {}; 
-let activeSessions = {}; // 向下相容以 email 為 Key 的舊 Session
+let activeSessions = {}; // email 索引
+let activeSessionsById = {}; // session_id 索引
 let sessionIntervals = {}; // 管理每門課 30 秒更新的 Timer
 let tempCodes = {};
+
+// 座標暫存 Buffer (In-memory，依據規格 §2.3)
+let coordBuffer = {};
 
 // 資料庫連線並自動建立與初始化資料表
 db.connect((err) => {
@@ -385,8 +396,44 @@ app.post('/api/courses/import-csv', (req, res) => {
 });
 
 // ==========================================
-// 4. 動態點名 Session 接口 (含 30 秒自動更新與 CSV 匯出)
+// 4. 動態點名 Session 接口 (整合定位與 30 秒自動更新)
 // ==========================================
+
+// 輔助函式：發送 HTTP POST 給定位計算程式 (Python http://127.0.0.1:8020/api/session/config)
+function notifyPositioningServer(configData) {
+    const postData = JSON.stringify(configData);
+    const options = {
+        hostname: '127.0.0.1',
+        port: 8020,
+        path: '/api/session/config',
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json; charset=UTF-8',
+            'Content-Length': Buffer.byteLength(postData)
+        },
+        timeout: 5000
+    };
+
+    const req = http.request(options, (res) => {
+        let resBody = '';
+        res.on('data', chunk => { resBody += chunk; });
+        res.on('end', () => {
+            console.log(`📡 [定位伺服器回應] 狀態碼: ${res.statusCode} | 內容: ${resBody}`);
+        });
+    });
+
+    req.on('error', (e) => {
+        console.log(`ℹ️ [定位伺服器通知] 本機 8020 端口未啟用 (${e.message})，不影響基礎簽到。`);
+    });
+
+    req.on('timeout', () => {
+        req.destroy();
+        console.log('⚠️ [定位伺服器通知] 連線至 127.0.0.1:8020 逾時');
+    });
+
+    req.write(postData);
+    req.end();
+}
 
 // 輔助函式：為指定課程更新所有學生的動態 OTP (時效 30 秒)
 function refreshCourseOtps(course_id) {
@@ -407,91 +454,135 @@ function refreshCourseOtps(course_id) {
     session.students = newOtpMap;
     session.updated_at = Date.now(); // 記錄本輪更新時間點
     console.log(`🔄 [Rolling OTP 更新] 課程 ID: ${course_id} 已更新全新一輪 OTP (有效時間 30s)`);
+
+    // 同步更新給定位計算程式
+    notifyPositioningServer({
+        session_id: session.session_id,
+        xor_key: session.xor_key,
+        otp_list: newOtpMap,
+        timeout: 5
+    });
 }
 
-// 老師啟動點名 (啟動 30 秒定時輪替定時器)
+// 老師啟動點名 (啟動 30 秒定時輪替定時器 + 初始化定位 Session)
 app.post('/api/session/start', (req, res) => {
-    const { email } = req.body;
+    const { email, password } = req.body;
     const course_id = req.body.course_id ? parseInt(req.body.course_id) : 1;
 
     if (!email) {
         return res.status(400).json({ success: false, message: '請提供 email' });
     }
 
-    console.log(`\n📢 [老師點名觸發] 教師: ${email} 請求啟動課程 ID: ${course_id}`);
+    const proceedStart = () => {
+        console.log(`\n📢 [老師點名觸發] 教師: ${email} 請求啟動課程 ID: ${course_id}`);
 
-    // 先清除既有的定時器 (若之前有未關閉的 Session)
-    if (sessionIntervals[course_id]) {
-        clearInterval(sessionIntervals[course_id]);
-        delete sessionIntervals[course_id];
-    }
+        // 先清除既有的定時器 (若之前有未關閉的 Session)
+        if (sessionIntervals[course_id]) {
+            clearInterval(sessionIntervals[course_id]);
+            delete sessionIntervals[course_id];
+        }
 
-    const sqlCourse = 'SELECT * FROM courses WHERE id = ?';
-    db.query(sqlCourse, [course_id], (cErr, courseResults) => {
-        const courseName = (courseResults && courseResults.length > 0) ? courseResults[0].course_name : "行動應用與物聯網專案實作";
-        const courseCode = (courseResults && courseResults.length > 0) ? courseResults[0].course_code : "MCU_BLE_PROJECT";
+        const sqlCourse = 'SELECT * FROM courses WHERE id = ?';
+        db.query(sqlCourse, [course_id], (cErr, courseResults) => {
+            const courseName = (courseResults && courseResults.length > 0) ? courseResults[0].course_name : "行動應用與物聯網專案實作";
+            const courseCode = (courseResults && courseResults.length > 0) ? courseResults[0].course_code : "MCU_BLE_PROJECT";
 
-        const sqlStudents = 'SELECT student_id, student_name FROM course_students WHERE course_id = ?';
-        db.query(sqlStudents, [course_id], (sErr, studentResults) => {
-            const xorKey = Math.floor(10000000 + Math.random() * 90000000).toString();
-            let studentOtpMap = {};
-            let studentRawList = {};
+            const sqlStudents = 'SELECT student_id, student_name FROM course_students WHERE course_id = ?';
+            db.query(sqlStudents, [course_id], (sErr, studentResults) => {
+                const xorKey = Math.floor(10000000 + Math.random() * 90000000).toString();
+                const sessionId = generateSecureSessionId(); // 🎯 不可預測隨機 16 碼 session_id
+                let studentOtpMap = {};
+                let studentRawList = {};
 
-            const studentsToUse = (studentResults && studentResults.length > 0) 
-                ? studentResults 
-                : DEFAULT_STUDENTS.map(s => ({ student_id: s.id, student_name: s.name }));
+                const studentsToUse = (studentResults && studentResults.length > 0) 
+                    ? studentResults 
+                    : DEFAULT_STUDENTS.map(s => ({ student_id: s.id, student_name: s.name }));
 
-            studentsToUse.forEach(s => {
-                const otp = Math.floor(100000 + Math.random() * 900000).toString();
-                studentOtpMap[s.student_id] = otp;
-                studentRawList[s.student_id] = s.student_name;
-            });
+                studentsToUse.forEach(s => {
+                    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+                    studentOtpMap[s.student_id] = otp;
+                    studentRawList[s.student_id] = s.student_name;
+                });
 
-            const sessionData = {
-                course_id: course_id,
-                course_name: courseName,
-                course_code: courseCode,
-                teacher_email: email,
-                xor_key: xorKey,
-                students: studentOtpMap,
-                previousStudents: {}, // 上一輪備用
-                studentRawList: studentRawList,
-                started_at: Date.now(),
-                updated_at: Date.now()
-            };
+                const cleanEmail = email.toLowerCase().trim();
+                const sessionData = {
+                    session_id: sessionId,
+                    course_id: course_id,
+                    course_name: courseName,
+                    course_code: courseCode,
+                    teacher_email: cleanEmail,
+                    xor_key: xorKey,
+                    students: studentOtpMap,
+                    previousStudents: {}, // 上一輪備用
+                    studentRawList: studentRawList,
+                    started_at: Date.now(),
+                    updated_at: Date.now()
+                };
 
-            activeCourseSessions[course_id] = sessionData;
-            activeSessions[email] = sessionData;
+                activeCourseSessions[course_id] = sessionData;
+                activeSessions[cleanEmail] = sessionData;
+                activeSessionsById[sessionId] = sessionData;
 
-            // 🎯 核心功能 1：建立每 30 秒自動更新 OTP 的定時器
-            sessionIntervals[course_id] = setInterval(() => {
-                refreshCourseOtps(course_id);
-            }, 30000); // 30,000 毫秒 = 30 秒
+                // 🎯 依規格清空並建立該 session_id 的座標暫存 Buffer
+                coordBuffer[sessionId] = {
+                    coordinateSystem: "grid32",
+                    updatedAt: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
+                    students: {}
+                };
 
-            console.log(`💾 [點名啟動完成] 課程: ${courseName} (ID: ${course_id}) | 初始 XOR Key: ${xorKey}`);
-            console.log(`⏱️ 每 30 秒自動換碼機制已啟動！`);
+                // 🎯 依規格 POST /api/session/config 通知同機 127.0.0.1:8020 Python 定位程式
+                notifyPositioningServer({
+                    session_id: sessionId,
+                    xor_key: xorKey,
+                    otp_list: studentOtpMap,
+                    timeout: 5
+                });
 
-            res.status(200).json({
-                success: true,
-                status: "success",
-                course_id: course_id,
-                course_name: courseName,
-                xor_key: xorKey,
-                otp_interval_seconds: 30
+                // 建立每 30 秒自動更新 OTP 的定時器
+                sessionIntervals[course_id] = setInterval(() => {
+                    refreshCourseOtps(course_id);
+                }, 30000); // 30,000 毫秒 = 30 秒
+
+                console.log(`💾 [點名啟動完成] 課程: ${courseName} (ID: ${course_id}) | Session ID: ${sessionId} | 初始 XOR Key: ${xorKey}`);
+                console.log(`⏱️ 每 30 秒自動換碼機制已啟動！`);
+
+                res.status(200).json({
+                    success: true,
+                    status: "success",
+                    course_id: course_id,
+                    course_name: courseName,
+                    session_id: sessionId,
+                    xor_key: xorKey,
+                    otp_interval_seconds: 30
+                });
             });
         });
-    });
+    };
+
+    // 若請求帶密碼則進行校驗；若舊版 App 未帶密碼則維持平滑放行相容
+    if (password) {
+        db.query('SELECT * FROM user WHERE email = ? AND password = ?', [email.toLowerCase().trim(), password], (err, rows) => {
+            if (err || !rows || rows.length === 0) {
+                return res.status(401).json({ status: 'failed', reason: 'invalid_credentials', message: '帳號或密碼錯誤' });
+            }
+            proceedStart();
+        });
+    } else {
+        proceedStart();
+    }
 });
 
 // 老師端查詢 OTP 名單 (回傳當前 OTP 與距離下次更新剩餘秒數)
 app.post('/api/session/otp-list', (req, res) => {
-    const { email, course_id } = req.body;
+    const { email, course_id, session_id } = req.body;
     
     let session = null;
-    if (course_id && activeCourseSessions[course_id]) {
+    if (session_id && activeSessionsById[session_id]) {
+        session = activeSessionsById[session_id];
+    } else if (course_id && activeCourseSessions[course_id]) {
         session = activeCourseSessions[course_id];
-    } else if (email && activeSessions[email]) {
-        session = activeSessions[email];
+    } else if (email && activeSessions[email.toLowerCase().trim()]) {
+        session = activeSessions[email.toLowerCase().trim()];
     } else {
         const allCourseIds = Object.keys(activeCourseSessions);
         if (allCourseIds.length > 0) {
@@ -509,6 +600,7 @@ app.post('/api/session/otp-list', (req, res) => {
 
     res.status(200).json({
         success: true,
+        session_id: session.session_id,
         course_name: session.course_name,
         otp_list: session.students,
         remaining_seconds: remainingSeconds
@@ -538,7 +630,6 @@ app.post('/api/session/get-token', (req, res) => {
 
     let myOtp = currentSession.students[student_id];
     if (!myOtp) {
-        // 若學生是臨時名單，動態註冊進去並生成 OTP
         const fallbackOtp = Math.floor(100000 + Math.random() * 900000).toString();
         currentSession.students[student_id] = fallbackOtp;
         currentSession.studentRawList[student_id] = `學生_${student_id}`;
@@ -550,6 +641,7 @@ app.post('/api/session/get-token', (req, res) => {
 
     res.status(200).json({
         success: true,
+        session_id: currentSession.session_id,
         otp: myOtp,
         xor_key: currentSession.xor_key,
         remaining_seconds: remainingSeconds
@@ -559,7 +651,7 @@ app.post('/api/session/get-token', (req, res) => {
 // 老師「結束點名」接口 (停止定時器並回傳出席總結)
 app.post('/api/session/stop', (req, res) => {
     const course_id = req.body.course_id ? parseInt(req.body.course_id) : 1;
-    const email = req.body.email;
+    const { email, session_id } = req.body;
 
     // 清除 30 秒輪替定時器
     if (sessionIntervals[course_id]) {
@@ -567,12 +659,13 @@ app.post('/api/session/stop', (req, res) => {
         delete sessionIntervals[course_id];
     }
 
-    const session = activeCourseSessions[course_id] || (email ? activeSessions[email] : null);
+    const session = (session_id && activeSessionsById[session_id]) || activeCourseSessions[course_id] || (email ? activeSessions[email.toLowerCase().trim()] : null);
     if (!session) {
         return res.status(404).json({ success: false, message: '該課程目前未在點名中或已結束' });
     }
 
     const courseName = session.course_name;
+    const currentSessionId = session.session_id;
 
     // 查詢最終出席人數統計
     const sqlCourseStudents = 'SELECT COUNT(*) as total FROM course_students WHERE course_id = ?';
@@ -585,14 +678,16 @@ app.post('/api/session/stop', (req, res) => {
 
             // 清理 Session
             delete activeCourseSessions[course_id];
-            if (email) delete activeSessions[email];
+            delete activeSessionsById[currentSessionId];
+            if (email) delete activeSessions[email.toLowerCase().trim()];
 
-            console.log(`🛑 [點名已結束] 課程: ${courseName} (ID: ${course_id})`);
+            console.log(`🛑 [點名已結束] 課程: ${courseName} (ID: ${course_id} / Session: ${currentSessionId})`);
             console.log(`📊 應到: ${totalStudents} 人，實到: ${attendedStudents} 人`);
 
             res.status(200).json({
                 success: true,
                 message: '課堂點名已順利結束！',
+                session_id: currentSessionId,
                 course_id: course_id,
                 course_name: courseName,
                 total_students: totalStudents,
@@ -603,7 +698,7 @@ app.post('/api/session/stop', (req, res) => {
     });
 });
 
-// 🎯 核心功能 2：匯出當堂點名結果 CSV 報表接口
+// 匯出當堂點名結果 CSV 報表接口
 app.get('/api/session/export-csv', (req, res) => {
     const course_id = req.query.course_id ? parseInt(req.query.course_id) : 1;
 
@@ -661,7 +756,172 @@ app.get('/api/session/export-csv', (req, res) => {
     });
 });
 
-// 學生打卡入庫
+// ==========================================
+// 5. 定位系統專用 API (規格 §2.1, §2.2, §2.4)
+// ==========================================
+
+// 2.1 定位計算程式上傳座標 (定位計算 Python -> Node)
+app.post('/api/coords', (req, res) => {
+    const { session_id, student_id, x, y, coordinate_system, timestamp } = req.body;
+
+    // 1. 欄位驗證
+    if (!session_id || !student_id || x === undefined || y === undefined || !coordinate_system || !timestamp) {
+        return res.status(400).json({
+            status: "failed",
+            reason: "invalid_body",
+            message: "缺少欄位或 JSON 解析失敗"
+        });
+    }
+
+    // 2. 檢查 session 是否在進行中
+    const session = activeSessionsById[session_id];
+    if (!session) {
+        return res.status(400).json({
+            status: "failed",
+            reason: "invalid_coord",
+            message: "session_id 不存在或已結束"
+        });
+    }
+
+    // 3. 檢查座標範圍 (grid32: 0 <= x, y <= 31)
+    const numX = parseFloat(x);
+    const numY = parseFloat(y);
+    if (coordinate_system === 'grid32') {
+        if (isNaN(numX) || isNaN(numY) || numX < 0 || numX > 31 || numY < 0 || numY > 31) {
+            return res.status(400).json({
+                status: "failed",
+                reason: "invalid_coord",
+                message: "座標超出 grid32 範圍 (0~31)"
+            });
+        }
+    }
+
+    // 4. 寫入 / 覆蓋 In-memory Buffer
+    if (!coordBuffer[session_id]) {
+        coordBuffer[session_id] = {
+            coordinateSystem: coordinate_system,
+            updatedAt: timestamp,
+            students: {}
+        };
+    }
+
+    coordBuffer[session_id].coordinateSystem = coordinate_system;
+    coordBuffer[session_id].updatedAt = timestamp;
+    coordBuffer[session_id].students[student_id] = {
+        x: numX,
+        y: numY,
+        timestamp: timestamp
+    };
+
+    console.log(`📍 [收到座標] Session: ${session_id} | 學生: ${student_id} -> (${numX}, ${numY}) [${coordinate_system}]`);
+
+    return res.status(200).json({
+        status: "ok",
+        accepted: true
+    });
+});
+
+// 2.2 App 端拉取本次點名所有學生座標 (App -> Node)
+app.post('/api/coords/get', (req, res) => {
+    const { email, password, session_id } = req.body;
+
+    if (!email || !password || !session_id) {
+        return res.status(400).json({
+            status: "failed",
+            reason: "invalid_body",
+            message: "請提供 email, password 與 session_id"
+        });
+    }
+
+    const cleanEmail = email.toLowerCase().trim();
+    db.query('SELECT * FROM user WHERE email = ? AND password = ?', [cleanEmail, password], (err, rows) => {
+        if (err || !rows || rows.length === 0) {
+            return res.status(401).json({
+                status: "failed",
+                reason: "invalid_credentials",
+                message: "帳號或密碼錯誤"
+            });
+        }
+
+        const session = activeSessionsById[session_id];
+        if (!session) {
+            return res.status(404).json({
+                status: "failed",
+                reason: "session_not_found",
+                message: "查無此 session_id"
+            });
+        }
+
+        if (session.teacher_email !== cleanEmail) {
+            return res.status(403).json({
+                status: "failed",
+                reason: "forbidden",
+                message: "此 session 不屬於該老師"
+            });
+        }
+
+        const buffer = coordBuffer[session_id] || { coordinateSystem: "grid32", students: {} };
+        const studentCoords = buffer.students || {};
+        const count = Object.keys(studentCoords).length;
+
+        return res.status(200).json({
+            session_id: session_id,
+            coordinate_system: buffer.coordinateSystem || "grid32",
+            count: count,
+            updated_at: buffer.updatedAt || new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
+            coords: studentCoords
+        });
+    });
+});
+
+// 2.4 老師清除本次定位資料 (App -> Node)
+app.post('/api/coords/clear', (req, res) => {
+    const { email, password, session_id } = req.body;
+
+    if (!email || !password || !session_id) {
+        return res.status(400).json({
+            status: "failed",
+            reason: "invalid_body",
+            message: "請提供 email, password 與 session_id"
+        });
+    }
+
+    const cleanEmail = email.toLowerCase().trim();
+    db.query('SELECT * FROM user WHERE email = ? AND password = ?', [cleanEmail, password], (err, rows) => {
+        if (err || !rows || rows.length === 0) {
+            return res.status(401).json({
+                status: "failed",
+                reason: "invalid_credentials",
+                message: "帳號或密碼錯誤"
+            });
+        }
+
+        const session = activeSessionsById[session_id];
+        if (session && session.teacher_email !== cleanEmail) {
+            return res.status(403).json({
+                status: "failed",
+                reason: "forbidden",
+                message: "此 session 不屬於該老師"
+            });
+        }
+
+        let clearedCount = 0;
+        if (coordBuffer[session_id]) {
+            clearedCount = Object.keys(coordBuffer[session_id].students || {}).length;
+            delete coordBuffer[session_id];
+        }
+
+        console.log(`🧹 [清除座標] Session: ${session_id} 已由 ${cleanEmail} 清除 (共清除了 ${clearedCount} 筆座標)`);
+
+        return res.status(200).json({
+            status: "ok",
+            session_id: session_id,
+            cleared: clearedCount
+        });
+    });
+});
+
+// 學生打卡入庫 (舊接口保留)
 app.post('/api/check-in', (req, res) => {
     const { student_info, device_address } = req.body;
     const course_id = req.body.course_id ? parseInt(req.body.course_id) : 1;
@@ -717,9 +977,10 @@ app.get('/api/users', (req, res) => {
 
 app.listen(3000, '0.0.0.0', () => {
     console.log('===========================================================');
-    console.log('🚀 藍牙防作弊點名系統 - 後端伺服器 (Rolling OTP + CSV 匯出版) 已啟動！');
+    console.log('🚀 藍牙防作弊點名系統 - 定位與點名全功能後端已啟動！');
     console.log('🌐 運行埠口: 3000');
+    console.log('📍 支援定位座標收發: /api/coords & /api/coords/get');
     console.log('⏱️ 支援 30 秒自動換碼 (Rolling OTP)');
-    console.log('📄 支援點名結果匯出 CSV: GET /api/session/export-csv?course_id=1');
+    console.log('📄 支援 CSV 匯出: GET /api/session/export-csv');
     console.log('===========================================================');
 });
