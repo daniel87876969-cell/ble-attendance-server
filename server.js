@@ -35,7 +35,7 @@ const DEFAULT_STUDENTS = [
 ];
 
 // ==========================================
-// 1. 設定區域 (資料庫、郵件、Session 隔離池)
+// 1. 設定區域 (資料庫、郵件、Session 與定時器隔離池)
 // ==========================================
 const db = mysql.createConnection({
     host: 'localhost',
@@ -44,9 +44,10 @@ const db = mysql.createConnection({
     database: 'ble_mcu'
 });
 
-// 以 course_id 為 Key 的動態點名 Sessions (同時支援 course_id 與 email 索引)
+// 以 course_id 為 Key 的動態點名 Sessions
 let activeCourseSessions = {}; 
 let activeSessions = {}; // 向下相容以 email 為 Key 的舊 Session
+let sessionIntervals = {}; // 管理每門課 30 秒更新的 Timer
 let tempCodes = {};
 
 // 資料庫連線並自動建立與初始化資料表
@@ -130,7 +131,23 @@ db.connect((err) => {
             }
         });
 
-        // 4. 確保預設老師帳號存在
+        // 4. 確保 check_in 表具有 created_at 欄位 (紀錄精準點名時間)
+        const checkCheckinTimeSql = `
+            SELECT COUNT(*) AS count 
+            FROM information_schema.COLUMNS 
+            WHERE TABLE_SCHEMA = 'ble_mcu' 
+              AND TABLE_NAME = 'check_in' 
+              AND COLUMN_NAME = 'created_at';
+        `;
+        db.query(checkCheckinTimeSql, (chkErr, chkRes) => {
+            if (!chkErr && chkRes && chkRes[0].count === 0) {
+                db.query("ALTER TABLE check_in ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;", (altErr) => {
+                    if (!altErr) console.log('⏰ [資料庫升級] check_in 表已補齊 created_at 打卡時間欄位！');
+                });
+            }
+        });
+
+        // 5. 確保預設老師帳號存在
         const initTeacherSql = `
             INSERT INTO user (user_id, name, password, email, device_id, role) 
             VALUES ('T001', '指導老師', 'teacher123', 'teacher@mail.mcu.edu.tw', 'ANY_DEVICE', 'teacher') 
@@ -368,13 +385,33 @@ app.post('/api/courses/import-csv', (req, res) => {
 });
 
 // ==========================================
-// 4. 動態點名 Session 接口 (新舊雙向相容)
+// 4. 動態點名 Session 接口 (含 30 秒自動更新與 CSV 匯出)
 // ==========================================
 
-// 老師啟動點名 (若 App 未傳 course_id 則自動預設為 1)
+// 輔助函式：為指定課程更新所有學生的動態 OTP (時效 30 秒)
+function refreshCourseOtps(course_id) {
+    const session = activeCourseSessions[course_id];
+    if (!session) return;
+
+    // 將現有的 OTP 留存為 previousStudents（寬限 30 秒，避免網路延遲）
+    session.previousStudents = { ...(session.students || {}) };
+
+    // 重新為所有已註冊學生產生新一輪 6 位數隨機碼
+    const studentIds = Object.keys(session.studentRawList || {});
+    let newOtpMap = {};
+
+    studentIds.forEach(id => {
+        newOtpMap[id] = Math.floor(100000 + Math.random() * 900000).toString();
+    });
+
+    session.students = newOtpMap;
+    session.updated_at = Date.now(); // 記錄本輪更新時間點
+    console.log(`🔄 [Rolling OTP 更新] 課程 ID: ${course_id} 已更新全新一輪 OTP (有效時間 30s)`);
+}
+
+// 老師啟動點名 (啟動 30 秒定時輪替定時器)
 app.post('/api/session/start', (req, res) => {
     const { email } = req.body;
-    // 關鍵修復：若 App 未提供 course_id，自動回退預設課程 1
     const course_id = req.body.course_id ? parseInt(req.body.course_id) : 1;
 
     if (!email) {
@@ -383,25 +420,31 @@ app.post('/api/session/start', (req, res) => {
 
     console.log(`\n📢 [老師點名觸發] 教師: ${email} 請求啟動課程 ID: ${course_id}`);
 
-    // 先讀取課程資訊
+    // 先清除既有的定時器 (若之前有未關閉的 Session)
+    if (sessionIntervals[course_id]) {
+        clearInterval(sessionIntervals[course_id]);
+        delete sessionIntervals[course_id];
+    }
+
     const sqlCourse = 'SELECT * FROM courses WHERE id = ?';
     db.query(sqlCourse, [course_id], (cErr, courseResults) => {
         const courseName = (courseResults && courseResults.length > 0) ? courseResults[0].course_name : "行動應用與物聯網專案實作";
         const courseCode = (courseResults && courseResults.length > 0) ? courseResults[0].course_code : "MCU_BLE_PROJECT";
 
-        // 再讀取修課名單
         const sqlStudents = 'SELECT student_id, student_name FROM course_students WHERE course_id = ?';
         db.query(sqlStudents, [course_id], (sErr, studentResults) => {
             const xorKey = Math.floor(10000000 + Math.random() * 90000000).toString();
             let studentOtpMap = {};
+            let studentRawList = {};
 
-            // 若資料庫有名單就用資料庫的，若為空則使用預設 5 位組員名單兜底
             const studentsToUse = (studentResults && studentResults.length > 0) 
                 ? studentResults 
                 : DEFAULT_STUDENTS.map(s => ({ student_id: s.id, student_name: s.name }));
 
             studentsToUse.forEach(s => {
-                studentOtpMap[s.student_id] = Math.floor(100000 + Math.random() * 900000).toString();
+                const otp = Math.floor(100000 + Math.random() * 900000).toString();
+                studentOtpMap[s.student_id] = otp;
+                studentRawList[s.student_id] = s.student_name;
             });
 
             const sessionData = {
@@ -410,28 +453,37 @@ app.post('/api/session/start', (req, res) => {
                 course_code: courseCode,
                 teacher_email: email,
                 xor_key: xorKey,
-                students: studentOtpMap
+                students: studentOtpMap,
+                previousStudents: {}, // 上一輪備用
+                studentRawList: studentRawList,
+                started_at: Date.now(),
+                updated_at: Date.now()
             };
 
-            // 雙向儲存：同時支援以 course_id 與以 email 索引用
             activeCourseSessions[course_id] = sessionData;
             activeSessions[email] = sessionData;
 
-            console.log(`💾 [點名初始化成功] 課程: ${courseName} (ID: ${course_id}) | XOR Key: ${xorKey}`);
-            console.log(`👥 已為 ${studentsToUse.length} 位學生生成動態專屬 OTP 名單！`);
+            // 🎯 核心功能 1：建立每 30 秒自動更新 OTP 的定時器
+            sessionIntervals[course_id] = setInterval(() => {
+                refreshCourseOtps(course_id);
+            }, 30000); // 30,000 毫秒 = 30 秒
+
+            console.log(`💾 [點名啟動完成] 課程: ${courseName} (ID: ${course_id}) | 初始 XOR Key: ${xorKey}`);
+            console.log(`⏱️ 每 30 秒自動換碼機制已啟動！`);
 
             res.status(200).json({
                 success: true,
                 status: "success",
                 course_id: course_id,
                 course_name: courseName,
-                xor_key: xorKey
+                xor_key: xorKey,
+                otp_interval_seconds: 30
             });
         });
     });
 });
 
-// 老師端查詢 OTP 名單 (支援 course_id 或 email 查詢)
+// 老師端查詢 OTP 名單 (回傳當前 OTP 與距離下次更新剩餘秒數)
 app.post('/api/session/otp-list', (req, res) => {
     const { email, course_id } = req.body;
     
@@ -441,7 +493,6 @@ app.post('/api/session/otp-list', (req, res) => {
     } else if (email && activeSessions[email]) {
         session = activeSessions[email];
     } else {
-        // 若都沒指定，直接抓最新的一個活動 Session
         const allCourseIds = Object.keys(activeCourseSessions);
         if (allCourseIds.length > 0) {
             session = activeCourseSessions[allCourseIds[0]];
@@ -452,14 +503,19 @@ app.post('/api/session/otp-list', (req, res) => {
         return res.status(404).json({ success: false, message: '目前未開啟任何點名 Session' });
     }
 
+    // 計算 30 秒週期剩餘秒數
+    const elapsed = Math.floor((Date.now() - session.updated_at) / 1000);
+    const remainingSeconds = Math.max(0, 30 - (elapsed % 30));
+
     res.status(200).json({
         success: true,
         course_name: session.course_name,
-        otp_list: session.students
+        otp_list: session.students,
+        remaining_seconds: remainingSeconds
     });
 });
 
-// 學生端獲取點名權杖
+// 學生端獲取點名權杖 (取得當前最新 30 秒 OTP)
 app.post('/api/session/get-token', (req, res) => {
     const { student_id } = req.body;
     const course_id = req.body.course_id ? parseInt(req.body.course_id) : 1;
@@ -480,28 +536,132 @@ app.post('/api/session/get-token', (req, res) => {
         return res.status(404).json({ success: false, message: '目前沒有任何進行中的課堂點名' });
     }
 
-    const myOtp = currentSession.students[student_id];
+    let myOtp = currentSession.students[student_id];
     if (!myOtp) {
+        // 若學生是臨時名單，動態註冊進去並生成 OTP
         const fallbackOtp = Math.floor(100000 + Math.random() * 900000).toString();
         currentSession.students[student_id] = fallbackOtp;
-
-        console.log(`📱 [動態補發] 學生 ${student_id} 取得 OTP: ${fallbackOtp}`);
-        return res.status(200).json({
-            success: true,
-            otp: fallbackOtp,
-            xor_key: currentSession.xor_key
-        });
+        currentSession.studentRawList[student_id] = `學生_${student_id}`;
+        myOtp = fallbackOtp;
     }
 
-    console.log(`📱 [學生取權杖] 學生 ${student_id} 提取 OTP: ${myOtp}`);
+    const elapsed = Math.floor((Date.now() - currentSession.updated_at) / 1000);
+    const remainingSeconds = Math.max(0, 30 - (elapsed % 30));
+
     res.status(200).json({
         success: true,
         otp: myOtp,
-        xor_key: currentSession.xor_key
+        xor_key: currentSession.xor_key,
+        remaining_seconds: remainingSeconds
     });
 });
 
-// 學生打卡入庫 (若未帶 course_id 預設為 1)
+// 老師「結束點名」接口 (停止定時器並回傳出席總結)
+app.post('/api/session/stop', (req, res) => {
+    const course_id = req.body.course_id ? parseInt(req.body.course_id) : 1;
+    const email = req.body.email;
+
+    // 清除 30 秒輪替定時器
+    if (sessionIntervals[course_id]) {
+        clearInterval(sessionIntervals[course_id]);
+        delete sessionIntervals[course_id];
+    }
+
+    const session = activeCourseSessions[course_id] || (email ? activeSessions[email] : null);
+    if (!session) {
+        return res.status(404).json({ success: false, message: '該課程目前未在點名中或已結束' });
+    }
+
+    const courseName = session.course_name;
+
+    // 查詢最終出席人數統計
+    const sqlCourseStudents = 'SELECT COUNT(*) as total FROM course_students WHERE course_id = ?';
+    const sqlAttended = 'SELECT COUNT(DISTINCT user_id) as attended FROM check_in WHERE course_id = ?';
+
+    db.query(sqlCourseStudents, [course_id], (cErr, cTotal) => {
+        db.query(sqlAttended, [course_id], (aErr, aAttended) => {
+            const totalStudents = (cTotal && cTotal[0]) ? cTotal[0].total : 0;
+            const attendedStudents = (aAttended && aAttended[0]) ? aAttended[0].attended : 0;
+
+            // 清理 Session
+            delete activeCourseSessions[course_id];
+            if (email) delete activeSessions[email];
+
+            console.log(`🛑 [點名已結束] 課程: ${courseName} (ID: ${course_id})`);
+            console.log(`📊 應到: ${totalStudents} 人，實到: ${attendedStudents} 人`);
+
+            res.status(200).json({
+                success: true,
+                message: '課堂點名已順利結束！',
+                course_id: course_id,
+                course_name: courseName,
+                total_students: totalStudents,
+                attended_students: attendedStudents,
+                absent_students: Math.max(0, totalStudents - attendedStudents)
+            });
+        });
+    });
+});
+
+// 🎯 核心功能 2：匯出當堂點名結果 CSV 報表接口
+app.get('/api/session/export-csv', (req, res) => {
+    const course_id = req.query.course_id ? parseInt(req.query.course_id) : 1;
+
+    // 1. 取得課程資訊
+    db.query('SELECT course_name FROM courses WHERE id = ?', [course_id], (cErr, cResults) => {
+        const courseName = (cResults && cResults.length > 0) ? cResults[0].course_name : '點名課程';
+
+        // 2. 取得修課名單
+        const sqlStudents = 'SELECT student_id, student_name FROM course_students WHERE course_id = ?';
+        db.query(sqlStudents, [course_id], (sErr, allStudents) => {
+            if (sErr) return res.status(500).send('讀取名單失敗');
+
+            const studentsList = (allStudents && allStudents.length > 0)
+                ? allStudents
+                : DEFAULT_STUDENTS.map(s => ({ student_id: s.id, student_name: s.name }));
+
+            // 3. 取得出席記錄 (包含打卡裝置與打卡時間)
+            const sqlCheckin = 'SELECT user_id, device_id, created_at FROM check_in WHERE course_id = ?';
+            db.query(sqlCheckin, [course_id], (ckErr, checkinList) => {
+                if (ckErr) return res.status(500).send('讀取打卡記錄失敗');
+
+                // 建立打卡對應表
+                let checkinMap = {};
+                (checkinList || []).forEach(row => {
+                    checkinMap[row.user_id.toString()] = {
+                        device: row.device_id || '無',
+                        time: row.created_at ? new Date(row.created_at).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }) : '已簽到'
+                    };
+                });
+
+                // 4. 組裝 CSV 內容 (加上 \uFEFF 避免 Windows Excel 開啟時中文亂碼)
+                let csvContent = '\uFEFF'; 
+                csvContent += '學號,姓名,課程名稱,出席狀態,簽到設備位址,簽到時間\n';
+
+                studentsList.forEach(s => {
+                    const studentId = s.student_id;
+                    const studentName = s.student_name;
+                    const record = checkinMap[studentId.toString()];
+                    const status = record ? '已出席' : '缺席';
+                    const device = record ? record.device : '-';
+                    const checkinTime = record ? record.time : '-';
+
+                    csvContent += `"${studentId}","${studentName}","${courseName}","${status}","${device}","${checkinTime}"\n`;
+                });
+
+                // 5. 設定檔案下載標頭
+                const fileName = `attendance_course_${course_id}_${Date.now()}.csv`;
+                res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+                res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+
+                console.log(`📄 [匯出 CSV] 成功產生課程 ID: ${course_id} 的點名報表！`);
+                res.status(200).send(csvContent);
+            });
+        });
+    });
+});
+
+// 學生打卡入庫
 app.post('/api/check-in', (req, res) => {
     const { student_info, device_address } = req.body;
     const course_id = req.body.course_id ? parseInt(req.body.course_id) : 1;
@@ -521,11 +681,10 @@ app.post('/api/check-in', (req, res) => {
     });
 });
 
-// 查詢出席狀態表格 (向下相容支援舊版 5 人回報格式)
+// 查詢出席狀態表格
 app.get('/api/session/attendance-status', (req, res) => {
     const course_id = req.query.course_id ? parseInt(req.query.course_id) : 1;
 
-    // 取得該課程名單
     const sqlCourseStudents = 'SELECT student_id, student_name FROM course_students WHERE course_id = ?';
     db.query(sqlCourseStudents, [course_id], (err, allStudents) => {
         const studentsList = (allStudents && allStudents.length > 0)
@@ -558,8 +717,9 @@ app.get('/api/users', (req, res) => {
 
 app.listen(3000, '0.0.0.0', () => {
     console.log('===========================================================');
-    console.log('🚀 藍牙防作弊點名系統 - 後端伺服器 (相容修復版) 已啟動！');
+    console.log('🚀 藍牙防作弊點名系統 - 後端伺服器 (Rolling OTP + CSV 匯出版) 已啟動！');
     console.log('🌐 運行埠口: 3000');
-    console.log('🔒 教師信箱限定: @mail.mcu.edu.tw (免綁定裝置)');
+    console.log('⏱️ 支援 30 秒自動換碼 (Rolling OTP)');
+    console.log('📄 支援點名結果匯出 CSV: GET /api/session/export-csv?course_id=1');
     console.log('===========================================================');
 });
