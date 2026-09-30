@@ -32,7 +32,7 @@ function generateSecureSessionId() {
     return crypto.randomBytes(8).toString('hex');
 }
 
-// 預設 5 人固定模擬課程名單 (用於自動初始化資料庫與相容)
+// 預設 5 人固定模擬課程名單 (用於自動初始化資料庫與向下相容)
 const DEFAULT_STUDENTS = [
     { id: "12360305", name: "組員A" },
     { id: "12360615", name: "組員B" },
@@ -396,7 +396,7 @@ app.post('/api/courses/import-csv', (req, res) => {
 });
 
 // ==========================================
-// 4. 動態點名 Session 接口 (整合定位與 30 秒自動更新)
+// 4. 動態點名 Session 接口 (含定位串接與詳細日誌輸出)
 // ==========================================
 
 // 輔助函式：發送 HTTP POST 給定位計算程式 (Python http://127.0.0.1:8020/api/session/config)
@@ -435,7 +435,7 @@ function notifyPositioningServer(configData) {
     req.end();
 }
 
-// 輔助函式：為指定課程更新所有學生的動態 OTP (時效 30 秒)
+// 輔助函式：為指定課程更新所有學生的動態 OTP (時效 30 秒) 並印出終端機日誌
 function refreshCourseOtps(course_id) {
     const session = activeCourseSessions[course_id];
     if (!session) return;
@@ -453,7 +453,16 @@ function refreshCourseOtps(course_id) {
 
     session.students = newOtpMap;
     session.updated_at = Date.now(); // 記錄本輪更新時間點
-    console.log(`🔄 [Rolling OTP 更新] 課程 ID: ${course_id} 已更新全新一輪 OTP (有效時間 30s)`);
+
+    // 🎯 核心修改：在終端機完整印出 XOR Key 與全體學生的全新 OTP
+    console.log('\n-----------------------------------------------------------');
+    console.log(`🔄 [Rolling OTP 更新] 課程: ${session.course_name} (ID: ${course_id})`);
+    console.log(`🔑 本堂課共用 XOR Key : ${session.xor_key}`);
+    console.log(`📋 最新 30 秒動態 OTP 表 (時效 30s) :`);
+    Object.keys(newOtpMap).forEach(sid => {
+        console.log(`   👉 學號: ${sid} (${session.studentRawList[sid] || '學生'}) -> OTP: ${newOtpMap[sid]}`);
+    });
+    console.log('-----------------------------------------------------------');
 
     // 同步更新給定位計算程式
     notifyPositioningServer({
@@ -474,8 +483,6 @@ app.post('/api/session/start', (req, res) => {
     }
 
     const proceedStart = () => {
-        console.log(`\n📢 [老師點名觸發] 教師: ${email} 請求啟動課程 ID: ${course_id}`);
-
         // 先清除既有的定時器 (若之前有未關閉的 Session)
         if (sessionIntervals[course_id]) {
             clearInterval(sessionIntervals[course_id]);
@@ -530,6 +537,18 @@ app.post('/api/session/start', (req, res) => {
                     students: {}
                 };
 
+                // 🎯 啟動時在終端機完整印出初始金鑰與名單 OTP
+                console.log('\n===========================================================');
+                console.log(`📢 [老師點名啟動] 課程: ${courseName} (ID: ${course_id})`);
+                console.log(`🔑 本次 Session ID: ${sessionId}`);
+                console.log(`🔑 本堂課共用 XOR Key : ${xorKey}`);
+                console.log(`👥 已為 ${studentsToUse.length} 位學生生成初始專屬 OTP 表：`);
+                Object.keys(studentOtpMap).forEach(sid => {
+                    console.log(`   👉 學號: ${sid} (${studentRawList[sid] || '學生'}) -> 初始 OTP: ${studentOtpMap[sid]}`);
+                });
+                console.log(`⏱️ 30 秒自動換碼機制 (Rolling OTP) 已啟動！`);
+                console.log('===========================================================');
+
                 // 🎯 依規格 POST /api/session/config 通知同機 127.0.0.1:8020 Python 定位程式
                 notifyPositioningServer({
                     session_id: sessionId,
@@ -542,9 +561,6 @@ app.post('/api/session/start', (req, res) => {
                 sessionIntervals[course_id] = setInterval(() => {
                     refreshCourseOtps(course_id);
                 }, 30000); // 30,000 毫秒 = 30 秒
-
-                console.log(`💾 [點名啟動完成] 課程: ${courseName} (ID: ${course_id}) | Session ID: ${sessionId} | 初始 XOR Key: ${xorKey}`);
-                console.log(`⏱️ 每 30 秒自動換碼機制已啟動！`);
 
                 res.status(200).json({
                     success: true,
@@ -572,7 +588,7 @@ app.post('/api/session/start', (req, res) => {
     }
 });
 
-// 老師端查詢 OTP 名單 (回傳當前 OTP 與距離下次更新剩餘秒數)
+// 老師端查詢 OTP 名單 (回傳當前 OTP、XOR Key 與倒數秒數)
 app.post('/api/session/otp-list', (req, res) => {
     const { email, course_id, session_id } = req.body;
     
@@ -598,16 +614,19 @@ app.post('/api/session/otp-list', (req, res) => {
     const elapsed = Math.floor((Date.now() - session.updated_at) / 1000);
     const remainingSeconds = Math.max(0, 30 - (elapsed % 30));
 
+    console.log(`🔍 [查詢 OTP 列表] 課程: ${session.course_name} | XOR Key: ${session.xor_key} | 名單人數: ${Object.keys(session.students).length} | 倒數: ${remainingSeconds}s`);
+
     res.status(200).json({
         success: true,
         session_id: session.session_id,
         course_name: session.course_name,
+        xor_key: session.xor_key,
         otp_list: session.students,
         remaining_seconds: remainingSeconds
     });
 });
 
-// 學生端獲取點名權杖 (取得當前最新 30 秒 OTP)
+// 學生端獲取點名權杖 (取得當前最新 30 秒 OTP 與 XOR Key)
 app.post('/api/session/get-token', (req, res) => {
     const { student_id } = req.body;
     const course_id = req.body.course_id ? parseInt(req.body.course_id) : 1;
@@ -638,6 +657,9 @@ app.post('/api/session/get-token', (req, res) => {
 
     const elapsed = Math.floor((Date.now() - currentSession.updated_at) / 1000);
     const remainingSeconds = Math.max(0, 30 - (elapsed % 30));
+
+    // 🎯 學生端索取時，即時在終端機印出該生的學號、OTP 與 XOR Key
+    console.log(`📱 [學生取權杖] 學號: ${student_id} | 取得 OTP: ${myOtp} | XOR Key: ${currentSession.xor_key} | 剩餘時效: ${remainingSeconds}s`);
 
     res.status(200).json({
         success: true,
@@ -681,7 +703,7 @@ app.post('/api/session/stop', (req, res) => {
             delete activeSessionsById[currentSessionId];
             if (email) delete activeSessions[email.toLowerCase().trim()];
 
-            console.log(`🛑 [點名已結束] 課程: ${courseName} (ID: ${course_id} / Session: ${currentSessionId})`);
+            console.log(`🛑 [點名已結束] 課程: ${courseName} (Session: ${currentSessionId})`);
             console.log(`📊 應到: ${totalStudents} 人，實到: ${attendedStudents} 人`);
 
             res.status(200).json({
@@ -932,10 +954,7 @@ app.post('/api/check-in', (req, res) => {
 
     const sql = 'INSERT INTO check_in (user_id, device_id, course_id) VALUES (?, ?, ?)';
     db.query(sql, [student_info, device_address, course_id], (err) => {
-        if (err) {
-            console.error('寫入點名紀錄失敗:', err);
-            return res.status(500).json({ success: false, message: 'Database Error', error: err });
-        }
+        if (err) return res.status(500).json({ success: false, message: 'Database Error', error: err });
         console.log(`✅ [點名成功] 學生 ${student_info} 已簽到課程 ID: ${course_id}`);
         res.status(200).json({ success: true, message: 'Success' });
     });
@@ -968,7 +987,6 @@ app.get('/api/session/attendance-status', (req, res) => {
     });
 });
 
-// 取得所有使用者清單
 app.get('/api/users', (req, res) => {
     db.query('SELECT user_id, name, email, device_id, role FROM user', (err, results) => {
         res.json(results);
