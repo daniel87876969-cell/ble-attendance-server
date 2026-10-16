@@ -195,8 +195,8 @@ db.connect((err) => {
 const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: {
-        user: 'nhentai696@gmail.com',
-        pass: 'ywikezgwjnasegke'
+        user: process.env.SMTP_MAIL,
+        pass: process.env.SMTP_KEY
     }
 });
 
