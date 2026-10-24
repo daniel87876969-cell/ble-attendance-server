@@ -31,6 +31,11 @@ function generateSecureSessionId() {
     return crypto.randomBytes(8).toString('hex');
 }
 
+// 座標相關 API 的統一錯誤記錄（維持既有 console + emoji 風格，不新增依賴）
+function logCoordFailure(tag, status, reason, extra) {
+    console.log(`🚫 [${tag}失敗] ${status} ${reason}${extra ? ' | ' + extra : ''}`);
+}
+
 // 預設 5 位專案組員修課名單 (課程 ID 1 專用)
 const COURSE_ENROLLED_STUDENTS = [
     { id: "12360305", name: "組員A" },
@@ -730,23 +735,39 @@ app.get('/api/session/export-csv', (req, res) => {
 // ==========================================
 
 app.post('/api/coords', (req, res) => {
-    const { session_id, student_id, x, y, coordinate_system, timestamp } = req.body;
+    const { session_id, student_id, x, y, coordinate_system, timestamp } = req.body || {};
 
     if (!session_id || !student_id || x === undefined || y === undefined || !coordinate_system || !timestamp) {
+        logCoordFailure('座標上報', 400, 'invalid_body', `session: ${session_id || '-'} | 學生: ${student_id || '-'} | 缺欄位`);
         return res.status(400).json({ status: "failed", reason: "invalid_body", message: "缺少欄位" });
     }
 
     const session = activeSessionsById[session_id];
     if (!session) {
+        logCoordFailure('座標上報', 400, 'invalid_coord', `session_id 不存在 (${session_id}) | 學生: ${student_id}`);
         return res.status(400).json({ status: "failed", reason: "invalid_coord", message: "session_id 不存在" });
+    }
+
+    // 只接受本次點名名單內的學生（get-token 會把未選課學生動態加入 studentRawList）
+    const isKnownStudent = !!(session.studentRawList && session.studentRawList[student_id]);
+    if (!isKnownStudent) {
+        logCoordFailure('座標上報', 400, 'invalid_coord', `學生 ${student_id} 不在 session ${session_id} 的名單內`);
+        return res.status(400).json({ status: "failed", reason: "invalid_coord", message: "student_id 不屬於本堂課" });
     }
 
     const numX = parseFloat(x);
     const numY = parseFloat(y);
     if (coordinate_system === 'grid32') {
         if (isNaN(numX) || isNaN(numY) || numX < 0 || numX > 31 || numY < 0 || numY > 31) {
+            logCoordFailure('座標上報', 400, 'invalid_coord', `學生: ${student_id} -> (${x}, ${y}) 超出 grid32 範圍`);
             return res.status(400).json({ status: "failed", reason: "invalid_coord", message: "座標超出 grid32 範圍" });
         }
+    }
+
+    // 學生送來的 timestamp 只接受字串或數字，避免任意物件污染 buffer
+    if (typeof timestamp !== 'string' && typeof timestamp !== 'number') {
+        logCoordFailure('座標上報', 400, 'invalid_body', `學生: ${student_id} timestamp 型別不合法 (${typeof timestamp})`);
+        return res.status(400).json({ status: "failed", reason: "invalid_body", message: "timestamp 格式錯誤" });
     }
 
     if (!coordBuffer[session_id]) {
@@ -762,33 +783,50 @@ app.post('/api/coords', (req, res) => {
 });
 
 app.post('/api/coords/get', (req, res) => {
-    const { email, password, session_id } = req.body;
+    const { email, password, session_id } = req.body || {};
     if (!email || !password || !session_id) {
+        logCoordFailure('座標查詢', 400, 'invalid_body', `session: ${session_id || '-'} | email: ${email || '-'} | 缺參數`);
         return res.status(400).json({ status: "failed", reason: "invalid_body", message: "缺少參數" });
     }
 
     const cleanEmail = email.toLowerCase().trim();
-    db.query('SELECT * FROM user WHERE email = ? AND password = ?', [cleanEmail, password], (err, rows) => {
-        if (err || !rows || rows.length === 0) {
+    db.query('SELECT user_id, email, role FROM user WHERE email = ? AND password = ?', [cleanEmail, password], (err, rows) => {
+        if (err) {
+            logCoordFailure('座標查詢', 500, 'db_error', `email: ${cleanEmail} | ${err.message}`);
+            return res.status(500).json({ status: "failed", reason: "db_error", message: "資料庫錯誤" });
+        }
+        if (!rows || rows.length === 0) {
+            logCoordFailure('座標查詢', 401, 'invalid_credentials', `email: ${cleanEmail} | session: ${session_id}`);
             return res.status(401).json({ status: "failed", reason: "invalid_credentials", message: "帳號或密碼錯誤" });
+        }
+
+        // 座標屬於教學資料，僅開放教師帳號拉取
+        if (rows[0].role !== 'teacher') {
+            logCoordFailure('座標查詢', 403, 'forbidden', `非教師帳號 (role: ${rows[0].role}) 嘗試拉取 | email: ${cleanEmail}`);
+            return res.status(403).json({ status: "failed", reason: "forbidden", message: "僅限教師帳號查詢座標" });
         }
 
         const session = activeSessionsById[session_id];
         if (!session) {
+            logCoordFailure('座標查詢', 404, 'session_not_found', `email: ${cleanEmail} | session: ${session_id}`);
             return res.status(404).json({ status: "failed", reason: "session_not_found", message: "查無此 session_id" });
         }
 
         if (session.teacher_email !== cleanEmail) {
+            logCoordFailure('座標查詢', 403, 'forbidden', `要求者: ${cleanEmail} | session 擁有者: ${session.teacher_email}`);
             return res.status(403).json({ status: "failed", reason: "forbidden", message: "此 session 不屬於該老師" });
         }
 
         const buffer = coordBuffer[session_id] || { coordinateSystem: "grid32", students: {} };
         const studentCoords = buffer.students || {};
+        const coordCount = Object.keys(studentCoords).length;
+
+        console.log(`🗺️ [座標查詢成功] 老師: ${cleanEmail} | Session: ${session_id} | 回傳 ${coordCount} 筆座標`);
 
         return res.status(200).json({
             session_id: session_id,
             coordinate_system: buffer.coordinateSystem || "grid32",
-            count: Object.keys(studentCoords).length,
+            count: coordCount,
             updated_at: buffer.updatedAt || new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
             coords: studentCoords
         });
@@ -796,15 +834,38 @@ app.post('/api/coords/get', (req, res) => {
 });
 
 app.post('/api/coords/clear', (req, res) => {
-    const { email, password, session_id } = req.body;
+    const { email, password, session_id } = req.body || {};
     if (!email || !password || !session_id) {
+        logCoordFailure('清除座標', 400, 'invalid_body', `session: ${session_id || '-'} | email: ${email || '-'} | 缺參數`);
         return res.status(400).json({ status: "failed", reason: "invalid_body", message: "缺少參數" });
     }
 
     const cleanEmail = email.toLowerCase().trim();
-    db.query('SELECT * FROM user WHERE email = ? AND password = ?', [cleanEmail, password], (err, rows) => {
-        if (err || !rows || rows.length === 0) {
+    db.query('SELECT user_id, email, role FROM user WHERE email = ? AND password = ?', [cleanEmail, password], (err, rows) => {
+        if (err) {
+            logCoordFailure('清除座標', 500, 'db_error', `email: ${cleanEmail} | ${err.message}`);
+            return res.status(500).json({ status: "failed", reason: "db_error", message: "資料庫錯誤" });
+        }
+        if (!rows || rows.length === 0) {
+            logCoordFailure('清除座標', 401, 'invalid_credentials', `email: ${cleanEmail} | session: ${session_id}`);
             return res.status(401).json({ status: "failed", reason: "invalid_credentials", message: "帳號或密碼錯誤" });
+        }
+
+        // 與 /api/coords/get 對齊：僅教師、且僅該 session 的擁有者可清除座標
+        if (rows[0].role !== 'teacher') {
+            logCoordFailure('清除座標', 403, 'forbidden', `非教師帳號 (role: ${rows[0].role}) 嘗試清除 | email: ${cleanEmail}`);
+            return res.status(403).json({ status: "failed", reason: "forbidden", message: "僅限教師帳號清除座標" });
+        }
+
+        const session = activeSessionsById[session_id];
+        if (!session) {
+            logCoordFailure('清除座標', 404, 'session_not_found', `email: ${cleanEmail} | session: ${session_id}`);
+            return res.status(404).json({ status: "failed", reason: "session_not_found", message: "查無此 session_id" });
+        }
+
+        if (session.teacher_email !== cleanEmail) {
+            logCoordFailure('清除座標', 403, 'forbidden', `要求者: ${cleanEmail} | session 擁有者: ${session.teacher_email}`);
+            return res.status(403).json({ status: "failed", reason: "forbidden", message: "此 session 不屬於該老師" });
         }
 
         let clearedCount = 0;
@@ -813,7 +874,7 @@ app.post('/api/coords/clear', (req, res) => {
             delete coordBuffer[session_id];
         }
 
-        console.log(`🧹 [清除座標] Session: ${session_id} 已清除 (${clearedCount} 筆座標)`);
+        console.log(`🧹 [清除座標] Session: ${session_id} 已清除 (${clearedCount} 筆座標) | 操作者: ${cleanEmail}`);
         return res.status(200).json({ status: "ok", session_id: session_id, cleared: clearedCount });
     });
 });
