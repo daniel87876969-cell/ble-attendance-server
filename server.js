@@ -5,11 +5,50 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.text({ type: ['text/csv', 'text/plain'] }));
+
+// ==========================================
+// 🚨 全域錯誤日誌記錄器 (Console & error.log)
+// ==========================================
+const ERROR_LOG_PATH = path.join(__dirname, 'error.log');
+
+function logSystemError(title, err, req = null) {
+    const timestamp = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
+    let reqInfo = '無 HTTP Context';
+    if (req) {
+        reqInfo = `${req.method} ${req.originalUrl} | IP: ${req.ip || req.connection.remoteAddress} | Body: ${JSON.stringify(req.body || {})}`;
+    }
+
+    const logEntry = `
+============================== [ERROR ALERT] ==============================
+⏰ 時間: ${timestamp}
+📌 類型: ${title}
+🌐 請求: ${reqInfo}
+⚠️ 訊息: ${err && err.message ? err.message : err}
+📑 堆疊 (Stack Trace):
+${err && err.stack ? err.stack : '無詳細堆疊追蹤'}
+===========================================================================
+`;
+
+    console.error(logEntry);
+    fs.appendFile(ERROR_LOG_PATH, logEntry + '\n', (fsErr) => {
+        if (fsErr) console.error('❌ 寫入 error.log 失敗:', fsErr);
+    });
+}
+
+process.on('uncaughtException', (err) => {
+    logSystemError('Uncaught Exception (未捕獲例外)', err);
+});
+
+process.on('unhandledRejection', (reason) => {
+    logSystemError('Unhandled Rejection (未處理的 Promise 拒絕)', reason);
+});
 
 app.get('/', (req, res) => {
     res.sendFile(__dirname + '/index.html');
@@ -52,29 +91,34 @@ const ALL_TEST_USERS = [
 ];
 
 // ==========================================
-// 1. 資料庫連線與自動初始化
+// 1. 資料庫連線池設定 (抗斷連 + 自動重連)
 // ==========================================
-const db = mysql.createConnection({
+const db = mysql.createPool({
     host: 'localhost',
     user: 'root',
     password: 'knowledge',
-    database: 'ble_mcu'
+    database: 'ble_mcu',
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 10000
 });
 
 let activeCourseSessions = {}; 
 let activeSessions = {};
 let activeSessionsById = {};
-let sessionIntervals = {};
 let tempCodes = {};
 let coordBuffer = {};
 
-db.connect((err) => {
+db.getConnection((err, connection) => {
     if (err) {
-        console.error('❌ 資料庫連線失敗:', err);
+        logSystemError('資料庫連線池初始化失敗', err);
     } else {
-        console.log('✅ 資料庫連線成功！');
+        console.log('✅ 資料庫連線池初始化成功！');
+        connection.release();
 
-        // 1. 確保 user 表結構包含 role 欄位
+        // 確保 user 表結構包含 role 欄位，且 password 欄位允許為 NULL (供匯入未註冊之學生使用)
         const checkRoleColumnSql = `
             SELECT COUNT(*) AS count 
             FROM information_schema.COLUMNS 
@@ -84,13 +128,12 @@ db.connect((err) => {
         `;
         db.query(checkRoleColumnSql, (cErr, cResults) => {
             if (!cErr && cResults[0].count === 0) {
-                db.query("ALTER TABLE user ADD COLUMN role VARCHAR(20) DEFAULT 'student';", (alterErr) => {
-                    if (!alterErr) console.log('🛠️ [資料庫升級] 成功為 user 資料表新增 role 欄位！');
-                });
+                db.query("ALTER TABLE user ADD COLUMN role VARCHAR(20) DEFAULT 'student';", () => {});
             }
         });
+        db.query("ALTER TABLE user MODIFY COLUMN password VARCHAR(255) NULL;", () => {});
 
-        // 2. 建立課程總表 courses
+        // 建立課程總表 courses
         const createCoursesTableSql = `
             CREATE TABLE IF NOT EXISTS courses (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -118,7 +161,7 @@ db.connect((err) => {
             }
         });
 
-        // 3. 建立並同步修課名單表 course_students
+        // 建立並同步修課名單表 course_students
         const createCourseStudentsTableSql = `
             CREATE TABLE IF NOT EXISTS course_students (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -143,7 +186,7 @@ db.connect((err) => {
             }
         });
 
-        // 4. 建立 App v6.1 專用課表與名單儲存表 teacher_schedules
+        // 建立 App v6.1 專用課表與名單儲存表 teacher_schedules
         const createTeacherSchedulesTableSql = `
             CREATE TABLE IF NOT EXISTS teacher_schedules (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -158,7 +201,7 @@ db.connect((err) => {
             if (!tsErr) console.log('🗓️ [資料庫] teacher_schedules 課表表已就緒');
         });
 
-        // 5. 初始化 7 位測試學生帳號 (密碼預設 123456，完全解除裝置限制)
+        // 初始化 7 位測試學生帳號 (密碼預設 123456，完全解除裝置限制)
         ALL_TEST_USERS.forEach(u => {
             const sqlInsertUser = `
                 INSERT INTO user (user_id, name, password, email, device_id, role)
@@ -169,8 +212,7 @@ db.connect((err) => {
         });
         console.log('🔓 [免綁定設定] 7 位學生帳號已全部確認可登入 (裝置限制已解除)！');
 
-        // 6. 初始化教師帳號：
-        // (A) 預設老師：有預設課程
+        // 初始化教師帳號：預設老師與全空白課表測試老師
         const initTeacherSql = `
             INSERT INTO user (user_id, name, password, email, device_id, role) 
             VALUES ('T001', '指導老師', 'teacher123', 'teacher@mail.mcu.edu.tw', 'ANY_DEVICE', 'teacher') 
@@ -180,7 +222,6 @@ db.connect((err) => {
             console.log('👨‍🏫 [系統就緒] 預設老師帳號 (teacher@mail.mcu.edu.tw) 已確認就緒！');
         });
 
-        // (B) 測試用全空白課表老師帳號：無預設排課，需先匯入課程
         const initNewTeacherSql = `
             INSERT INTO user (user_id, name, password, email, device_id, role) 
             VALUES ('T002', '全新測試老師', 'teacher123', 'newteacher@mail.mcu.edu.tw', 'ANY_DEVICE', 'teacher') 
@@ -195,13 +236,13 @@ db.connect((err) => {
 const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: {
-        user: 'nhentai696@gmail.com',
-        pass: 'ywikezgwjnasegke'
+        user: process.env.SMTP_MAIL,
+        pass: process.env.SMTP_KEY
     }
 });
 
 // ==========================================
-// 2. 帳號與登入接口 (完全解除裝置綁定)
+// 2. 帳號與登入接口 (學生註冊後才正式設定密碼)
 // ==========================================
 
 app.post('/api/send-code', (req, res) => {
@@ -215,18 +256,22 @@ app.post('/api/send-code', (req, res) => {
     tempCodes[email] = { code, expires: Date.now() + 300000, role }; 
 
     const mailOptions = {
-        from: '"藍牙點名系統" <nhentai696@gmail.com>',
+        from: `"藍牙點名系統" <${process.env.SMTP_MAIL || 'admin@mcu.edu.tw'}>`,
         to: email,
         subject: `【點名系統】${role === 'teacher' ? '教師' : '學生'}註冊驗證碼`,
-        text: `您好！您的驗證碼是：${code}\n請於 5 分鐘內輸入此代碼以完成註冊。`
+        text: `您好！您的驗證碼是：${code}\n請於 5 分鐘內輸入此代碼以完成註冊與密碼設定。`
     };
 
     transporter.sendMail(mailOptions, (err) => {
-        if (err) return res.status(500).json({ success: false, message: '寄信失敗' });
+        if (err) {
+            logSystemError('寄送驗證碼失敗', err, req);
+            return res.status(500).json({ success: false, message: '寄信失敗' });
+        }
         res.status(200).json({ success: true, message: 'Sent', role });
     });
 });
 
+// 學生親自註冊設定密碼
 app.post('/api/register', (req, res) => {
     const { user_id, name, email, password, code } = req.body;
     const record = tempCodes[email];
@@ -235,21 +280,25 @@ app.post('/api/register', (req, res) => {
     if (Date.now() > record.expires) return res.status(400).json({ success: false, message: '驗證碼已過期' });
 
     const role = getRoleByEmail(email);
-    const finalDeviceId = 'ANY_DEVICE'; // 免綁定裝置
+    const finalDeviceId = 'ANY_DEVICE';
 
-    db.query('SELECT * FROM user WHERE user_id = ? OR email = ?', [user_id, email], (checkErr, checkResults) => {
-        if (checkErr) return res.status(500).json({ success: false, message: '資料庫檢查錯誤' });
-        if (checkResults && checkResults.length > 0) {
-            return res.status(400).json({ success: false, message: '此帳號或信箱已註冊過！' });
+    // 若帳號已先由課表預先匯入，此處更新其密碼完成正式註冊；若無則直接新增
+    const sql = `
+        INSERT INTO user (user_id, name, password, email, device_id, role) 
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE 
+            name = VALUES(name),
+            password = VALUES(password),
+            device_id = 'ANY_DEVICE';
+    `;
+    db.query(sql, [user_id, name, password, email, finalDeviceId, role], (err) => {
+        if (err) {
+            logSystemError('註冊寫入密碼失敗', err, req);
+            return res.status(500).json({ success: false, message: '資料庫錯誤' });
         }
-
-        const sql = `INSERT INTO user (user_id, name, password, email, device_id, role) VALUES (?, ?, ?, ?, ?, ?)`;
-        db.query(sql, [user_id, name, password, email, finalDeviceId, role], (err) => {
-            if (err) return res.status(500).json({ success: false, message: '資料庫錯誤' });
-            delete tempCodes[email];
-            console.log(`👤 [新用戶註冊] 工號/學號: ${user_id} 註冊成功 (免綁定裝置)！`);
-            res.status(200).json({ success: true, status: 'success', message: 'Success', role: role });
-        });
+        delete tempCodes[email];
+        console.log(`👤 [學生註冊成功] 學號: ${user_id} (${email}) 已完成密碼設定！`);
+        res.status(200).json({ success: true, status: 'success', message: 'Success', role: role });
     });
 });
 
@@ -263,15 +312,31 @@ app.post('/api/auth/login', (req, res) => {
     const cleanEmail = email.toLowerCase().trim();
     const inferredRole = getRoleByEmail(cleanEmail);
 
-    const sql = 'SELECT * FROM user WHERE email = ? AND password = ?';
-    db.query(sql, [cleanEmail, password], (err, results) => {
-        if (err) return res.status(500).json({ success: false, message: '資料庫錯誤' });
+    const sql = 'SELECT * FROM user WHERE email = ?';
+    db.query(sql, [cleanEmail], (err, results) => {
+        if (err) {
+            logSystemError('登入查詢資料庫失敗', err, req);
+            return res.status(500).json({ success: false, message: '資料庫錯誤' });
+        }
         if (!results || results.length === 0) {
-            console.log(`❌ [登入失敗] 信箱或密碼錯誤: ${cleanEmail}`);
-            return res.status(401).json({ success: false, message: '信箱或密碼錯誤' });
+            return res.status(401).json({ success: false, message: '此帳號尚未存在或尚未匯入' });
         }
 
         const user = results[0];
+
+        // 檢查學生是否尚未親自註冊設定密碼
+        if (!user.password) {
+            return res.status(401).json({ 
+                success: false, 
+                message: '此學號已由課表匯入，但尚未完成正式註冊，請先點擊註冊並設定您的密碼！' 
+            });
+        }
+
+        // 檢查密碼
+        if (user.password !== password) {
+            return res.status(401).json({ success: false, message: '信箱或密碼錯誤' });
+        }
+
         const userRole = user.role || inferredRole;
 
         if (userRole === 'teacher') {
@@ -289,7 +354,6 @@ app.post('/api/auth/login', (req, res) => {
             });
         }
 
-        // 學生裝置檢查完全關閉，任意設備均可直接登入
         console.log(`🎓 [學生登入成功] 學號: ${user.user_id} (${cleanEmail})`);
         return res.status(200).json({
             success: true,
@@ -303,10 +367,9 @@ app.post('/api/auth/login', (req, res) => {
 });
 
 // ==========================================
-// 3. 課表雙向同步 API (App v6.1 專用端點)
+// 3. 課表雙向同步 API (同名分 1、2 + 學生帳號預先建置)
 // ==========================================
 
-// (1) 課表同步端點：老師匯入課程後將課表與名單更新進資料庫
 app.post('/api/teacher/schedule/sync', (req, res) => {
     const { email, schedule, students } = req.body;
 
@@ -315,10 +378,10 @@ app.post('/api/teacher/schedule/sync', (req, res) => {
     }
 
     const cleanEmail = email.toLowerCase().trim();
-    // 確保儲存時為字串化之 JSON
     const scheduleStr = typeof schedule === 'object' ? JSON.stringify(schedule) : (schedule || "");
     const studentsStr = typeof students === 'object' ? JSON.stringify(students) : (students || "");
 
+    // 1. 先將課表原始 JSON 寫入 teacher_schedules 表
     const sqlUpsert = `
         INSERT INTO teacher_schedules (teacher_email, schedule_data, students_data)
         VALUES (?, ?, ?)
@@ -330,19 +393,101 @@ app.post('/api/teacher/schedule/sync', (req, res) => {
 
     db.query(sqlUpsert, [cleanEmail, scheduleStr, studentsStr], (err) => {
         if (err) {
-            console.error('❌ [課表同步失敗]:', err);
+            logSystemError('課表同步寫入 teacher_schedules 失敗', err, req);
             return res.status(500).json({ success: false, message: '資料庫寫入課表失敗' });
         }
 
-        console.log(`📥 [課表與名單同步成功] 老師: ${cleanEmail} 最新課表與名單已成功更新至資料庫！`);
-        return res.status(200).json({
-            success: true,
-            message: '課表與名單同步成功'
-        });
+        console.log(`📥 [課表與名單同步] 老師: ${cleanEmail} 原始課表已暫存，處理同名分班與學生帳號...`);
+
+        // 2. 解析學生名單 JSON，自動建立課程與學生修課關係
+        try {
+            const parsedStudents = typeof students === 'string' ? JSON.parse(students || "{}") : (students || {});
+            const courseNames = Object.keys(parsedStudents);
+
+            if (courseNames.length === 0) {
+                return res.status(200).json({ success: true, message: '課表已儲存 (無學生名單需要匯入)' });
+            }
+
+            // 處理每門課
+            courseNames.forEach((baseCourseName) => {
+                const studentList = parsedStudents[baseCourseName] || [];
+                if (!Array.isArray(studentList) || studentList.length === 0) return;
+
+                // 檢查同名課程：若已有相同課程名稱，自動在後方加上 1、2...
+                const sqlCheckSameName = `
+                    SELECT course_name FROM courses 
+                    WHERE teacher_id = ? AND (course_name = ? OR course_name LIKE ?)
+                    ORDER BY id ASC;
+                `;
+                db.query(sqlCheckSameName, [cleanEmail, baseCourseName, `${baseCourseName} %`], (chkErr, existingCourses) => {
+                    if (chkErr) return logSystemError('查詢同名課程失敗', chkErr, req);
+
+                    let finalCourseName = baseCourseName;
+                    if (existingCourses && existingCourses.length > 0) {
+                        const count = existingCourses.length;
+                        finalCourseName = `${baseCourseName} ${count}`;
+                    }
+
+                    const courseCode = 'COURSE_' + crypto.createHash('md5').update(finalCourseName + Date.now()).digest('hex').substring(0, 8);
+                    const sqlInsertCourse = `
+                        INSERT INTO courses (course_code, course_name, teacher_id)
+                        VALUES (?, ?, ?);
+                    `;
+
+                    db.query(sqlInsertCourse, [courseCode, finalCourseName, cleanEmail], (cErr, cResult) => {
+                        if (cErr) return logSystemError(`建立課程 ${finalCourseName} 失敗`, cErr, req);
+                        const newCourseId = cResult.insertId;
+
+                        // 將名單內學生預先建立至 user 表，密碼設為 NULL (等待學生自行註冊驗證)
+                        studentList.forEach(st => {
+                            const studentId = (st.id || st.student_id || '').toString().trim();
+                            const studentName = st.name || st.student_name || `學生_${studentId}`;
+                            if (!studentId) return;
+
+                            const studentEmail = `${studentId}@me.mcu.edu.tw`;
+                            const sqlInsertUser = `
+                                INSERT INTO user (user_id, name, password, email, device_id, role)
+                                VALUES (?, ?, NULL, ?, 'ANY_DEVICE', 'student')
+                                ON DUPLICATE KEY UPDATE 
+                                    name = VALUES(name),
+                                    device_id = 'ANY_DEVICE';
+                            `;
+                            db.query(sqlInsertUser, [studentId, studentName, studentEmail], (uErr) => {
+                                if (uErr) logSystemError(`預建學生帳號 ${studentId} 失敗`, uErr, req);
+                            });
+                        });
+
+                        // 建立課程與學生的修課關係
+                        const enrollValues = studentList
+                            .filter(st => (st.id || st.student_id))
+                            .map(st => [newCourseId, (st.id || st.student_id).toString().trim(), st.name || st.student_name || '']);
+
+                        if (enrollValues.length > 0) {
+                            const sqlEnroll = `INSERT IGNORE INTO course_students (course_id, student_id, student_name) VALUES ?;`;
+                            db.query(sqlEnroll, [enrollValues], (eErr) => {
+                                if (eErr) {
+                                    logSystemError(`課程 ${finalCourseName} 關聯修課名單失敗`, eErr, req);
+                                } else {
+                                    console.log(`🎓 [課程建立成功] 課程:【${finalCourseName}】(ID: ${newCourseId})，共 ${enrollValues.length} 位學生！(密碼待親自註冊設定)`);
+                                }
+                            });
+                        }
+                    });
+                });
+            });
+
+            return res.status(200).json({
+                success: true,
+                message: '課表與名單同步成功，同名課程已自動編號，學生帳號已建立！'
+            });
+
+        } catch (parseError) {
+            logSystemError('解析 students JSON 格式錯誤', parseError, req);
+            return res.status(200).json({ success: true, message: '課表已儲存，學生名單格式錯誤未解析' });
+        }
     });
 });
 
-// (2) 課表拉取端點：老師登入後自伺服器拉取最新課表與名單
 app.post('/api/teacher/schedule/get', (req, res) => {
     const { email } = req.body;
 
@@ -355,13 +500,11 @@ app.post('/api/teacher/schedule/get', (req, res) => {
 
     db.query(sqlQuery, [cleanEmail], (err, rows) => {
         if (err) {
-            console.error('❌ [查詢課表錯誤]:', err);
+            logSystemError('查詢課表錯誤', err, req);
             return res.status(500).json({ success: false, message: '伺服器查詢錯誤' });
         }
 
-        // 若該老師已有儲存課表
         if (rows && rows.length > 0 && rows[0].schedule_data) {
-            console.log(`📤 [課表拉取成功] 老師: ${cleanEmail} 已順利取得雲端課表與名單`);
             return res.status(200).json({
                 success: true,
                 schedule: rows[0].schedule_data,
@@ -369,8 +512,6 @@ app.post('/api/teacher/schedule/get', (req, res) => {
             });
         }
 
-        // 若為新老師（如 newteacher@mail.mcu.edu.tw），回傳空白課表
-        console.log(`ℹ️ [無排課紀錄] 老師: ${cleanEmail} 目前無雲端課表，回傳全空白課表`);
         return res.status(200).json({
             success: true,
             schedule: "",
@@ -380,7 +521,7 @@ app.post('/api/teacher/schedule/get', (req, res) => {
 });
 
 // ==========================================
-// 4. 動態點名 Session 接口 (整合 30 秒換碼與日誌)
+// 4. 固定 OTP 點名 Session 接口 (整堂課不更換)
 // ==========================================
 
 function notifyPositioningServer(configData) {
@@ -408,39 +549,7 @@ function notifyPositioningServer(configData) {
     req.end();
 }
 
-function refreshCourseOtps(course_id) {
-    const session = activeCourseSessions[course_id];
-    if (!session) return;
-
-    session.previousStudents = { ...(session.students || {}) };
-    const studentIds = Object.keys(session.studentRawList || {});
-    let newOtpMap = {};
-
-    studentIds.forEach(id => {
-        newOtpMap[id] = Math.floor(100000 + Math.random() * 900000).toString();
-    });
-
-    session.students = newOtpMap;
-    session.updated_at = Date.now();
-
-    console.log('\n-----------------------------------------------------------');
-    console.log(`🔄 [Rolling OTP 更新] 課程: ${session.course_name} (ID: ${course_id})`);
-    console.log(`🔑 本堂課共用 XOR Key : ${session.xor_key}`);
-    console.log(`📋 最新 30 秒動態 OTP 表 (時效 30s) :`);
-    Object.keys(newOtpMap).forEach(sid => {
-        console.log(`   👉 學號: ${sid} (${session.studentRawList[sid] || '學生'}) -> OTP: ${newOtpMap[sid]}`);
-    });
-    console.log('-----------------------------------------------------------');
-
-    notifyPositioningServer({
-        session_id: session.session_id,
-        xor_key: session.xor_key,
-        otp_list: newOtpMap,
-        timeout: 5
-    });
-}
-
-// 老師開始點名 Session
+// 老師開始點名 (整個點名階段產生一次固定 OTP，不再輪替)
 app.post('/api/session/start', (req, res) => {
     const { email, password } = req.body;
     const course_id = req.body.course_id ? parseInt(req.body.course_id) : 1;
@@ -450,18 +559,23 @@ app.post('/api/session/start', (req, res) => {
     }
 
     const proceedStart = () => {
-        if (sessionIntervals[course_id]) {
-            clearInterval(sessionIntervals[course_id]);
-            delete sessionIntervals[course_id];
-        }
-
         const sqlCourse = 'SELECT * FROM courses WHERE id = ?';
         db.query(sqlCourse, [course_id], (cErr, courseResults) => {
+            if (cErr) {
+                logSystemError('啟動點名查詢課程失敗', cErr, req);
+                return res.status(500).json({ success: false, message: '資料庫錯誤' });
+            }
+
             const courseName = (courseResults && courseResults.length > 0) ? courseResults[0].course_name : "行動應用與物聯網專案實作";
             const courseCode = (courseResults && courseResults.length > 0) ? courseResults[0].course_code : "MCU_BLE_PROJECT";
 
             const sqlStudents = 'SELECT student_id, student_name FROM course_students WHERE course_id = ?';
             db.query(sqlStudents, [course_id], (sErr, studentResults) => {
+                if (sErr) {
+                    logSystemError('啟動點名查詢學生名單失敗', sErr, req);
+                    return res.status(500).json({ success: false, message: '資料庫錯誤' });
+                }
+
                 const xorKey = Math.floor(10000000 + Math.random() * 90000000).toString();
                 const sessionId = generateSecureSessionId();
                 let studentOtpMap = {};
@@ -486,10 +600,8 @@ app.post('/api/session/start', (req, res) => {
                     teacher_email: cleanEmail,
                     xor_key: xorKey,
                     students: studentOtpMap,
-                    previousStudents: {},
                     studentRawList: studentRawList,
-                    started_at: Date.now(),
-                    updated_at: Date.now()
+                    started_at: Date.now()
                 };
 
                 activeCourseSessions[course_id] = sessionData;
@@ -504,13 +616,12 @@ app.post('/api/session/start', (req, res) => {
 
                 console.log('\n===========================================================');
                 console.log(`📢 [老師點名啟動] 課程: ${courseName} (ID: ${course_id})`);
-                console.log(`🔑 本次 Session ID: ${sessionId}`);
-                console.log(`🔑 本堂課共用 XOR Key : ${xorKey}`);
-                console.log(`👥 本次課堂修課學生共 ${studentsToUse.length} 人：`);
+                console.log(`🔑 本次 Session ID: ${sessionId} | 固定 XOR Key: ${xorKey}`);
+                console.log(`👥 本次點名學生固定 OTP 表：`);
                 Object.keys(studentOtpMap).forEach(sid => {
-                    console.log(`   👉 學號: ${sid} (${studentRawList[sid] || '學生'}) -> 初始 OTP: ${studentOtpMap[sid]}`);
+                    console.log(`   👉 學號: ${sid} (${studentRawList[sid] || '學生'}) -> 固定 OTP: ${studentOtpMap[sid]}`);
                 });
-                console.log(`⏱️ 30 秒自動換碼機制已啟動！`);
+                console.log(`🔒 全程使用固定 OTP，不再每 30 秒換碼`);
                 console.log('===========================================================');
 
                 notifyPositioningServer({
@@ -520,10 +631,6 @@ app.post('/api/session/start', (req, res) => {
                     timeout: 5
                 });
 
-                sessionIntervals[course_id] = setInterval(() => {
-                    refreshCourseOtps(course_id);
-                }, 30000);
-
                 res.status(200).json({
                     success: true,
                     status: "success",
@@ -531,7 +638,7 @@ app.post('/api/session/start', (req, res) => {
                     course_name: courseName,
                     session_id: sessionId,
                     xor_key: xorKey,
-                    otp_interval_seconds: 30
+                    otp_interval_seconds: 0
                 });
             });
         });
@@ -539,7 +646,11 @@ app.post('/api/session/start', (req, res) => {
 
     if (password) {
         db.query('SELECT * FROM user WHERE email = ? AND password = ?', [email.toLowerCase().trim(), password], (err, rows) => {
-            if (err || !rows || rows.length === 0) {
+            if (err) {
+                logSystemError('啟動點名驗證教師密碼失敗', err, req);
+                return res.status(500).json({ status: 'failed', message: '資料庫錯誤' });
+            }
+            if (!rows || rows.length === 0) {
                 return res.status(401).json({ status: 'failed', reason: 'invalid_credentials', message: '帳號或密碼錯誤' });
             }
             proceedStart();
@@ -549,7 +660,7 @@ app.post('/api/session/start', (req, res) => {
     }
 });
 
-// 老師端查詢 OTP 名單
+// 老師端查詢 OTP 名單 (整堂固定)
 app.post('/api/session/otp-list', (req, res) => {
     const { email, course_id, session_id } = req.body;
     
@@ -569,20 +680,17 @@ app.post('/api/session/otp-list', (req, res) => {
         return res.status(404).json({ success: false, message: '目前未開啟任何點名 Session' });
     }
 
-    const elapsed = Math.floor((Date.now() - session.updated_at) / 1000);
-    const remainingSeconds = Math.max(0, 30 - (elapsed % 30));
-
     res.status(200).json({
         success: true,
         session_id: session.session_id,
         course_name: session.course_name,
         xor_key: session.xor_key,
         otp_list: session.students,
-        remaining_seconds: remainingSeconds
+        remaining_seconds: 9999
     });
 });
 
-// 學生端獲取點名權杖
+// 學生端獲取點名權杖 (整堂固定)
 app.post('/api/session/get-token', (req, res) => {
     const { student_id } = req.body;
     const course_id = req.body.course_id ? parseInt(req.body.course_id) : 1;
@@ -605,18 +713,11 @@ app.post('/api/session/get-token', (req, res) => {
     let myOtp = currentSession.students[student_id];
 
     if (!myOtp) {
-        // 未修課學生測試防作弊
         const fallbackOtp = Math.floor(100000 + Math.random() * 900000).toString();
         currentSession.students[student_id] = fallbackOtp;
         currentSession.studentRawList[student_id] = `未選課學生_${student_id}`;
         myOtp = fallbackOtp;
-        console.log(`⚠️ [非修課學生取權杖] 學號: ${student_id} (不在名單內) 動態獲得 OTP: ${myOtp}`);
-    } else {
-        console.log(`📱 [修課學生取權杖] 學號: ${student_id} (名單內) 取得 OTP: ${myOtp} | XOR Key: ${currentSession.xor_key}`);
     }
-
-    const elapsed = Math.floor((Date.now() - currentSession.updated_at) / 1000);
-    const remainingSeconds = Math.max(0, 30 - (elapsed % 30));
 
     res.status(200).json({
         success: true,
@@ -624,7 +725,7 @@ app.post('/api/session/get-token', (req, res) => {
         session_id: currentSession.session_id,
         otp: myOtp,
         xor_key: currentSession.xor_key,
-        remaining_seconds: remainingSeconds
+        remaining_seconds: 9999
     });
 });
 
@@ -632,11 +733,6 @@ app.post('/api/session/get-token', (req, res) => {
 app.post('/api/session/stop', (req, res) => {
     const course_id = req.body.course_id ? parseInt(req.body.course_id) : 1;
     const { email, session_id } = req.body;
-
-    if (sessionIntervals[course_id]) {
-        clearInterval(sessionIntervals[course_id]);
-        delete sessionIntervals[course_id];
-    }
 
     const session = (session_id && activeSessionsById[session_id]) || activeCourseSessions[course_id] || (email ? activeSessions[email.toLowerCase().trim()] : null);
     if (!session) {
@@ -658,8 +754,7 @@ app.post('/api/session/stop', (req, res) => {
             delete activeSessionsById[currentSessionId];
             if (email) delete activeSessions[email.toLowerCase().trim()];
 
-            console.log(`🛑 [點名已結束] 課程: ${courseName} (Session: ${currentSessionId})`);
-            console.log(`📊 應到: ${totalStudents} 人，實到: ${attendedStudents} 人`);
+            console.log(`🛑 [點名結束] 課程: ${courseName} (Session: ${currentSessionId}) 應到: ${totalStudents}, 實到: ${attendedStudents}`);
 
             res.status(200).json({
                 success: true,
@@ -681,8 +776,8 @@ app.get('/api/session/export-csv', (req, res) => {
 
     db.query('SELECT course_name FROM courses WHERE id = ?', [course_id], (cErr, cResults) => {
         const courseName = (cResults && cResults.length > 0) ? cResults[0].course_name : '點名課程';
-
         const sqlStudents = 'SELECT student_id, student_name FROM course_students WHERE course_id = ?';
+
         db.query(sqlStudents, [course_id], (sErr, allStudents) => {
             if (sErr) return res.status(500).send('讀取名單失敗');
 
@@ -757,7 +852,6 @@ app.post('/api/coords', (req, res) => {
     coordBuffer[session_id].updatedAt = timestamp;
     coordBuffer[session_id].students[student_id] = { x: numX, y: numY, timestamp: timestamp };
 
-    console.log(`📍 [收到座標] Session: ${session_id} | 學生: ${student_id} -> (${numX}, ${numY}) [${coordinate_system}]`);
     return res.status(200).json({ status: "ok", accepted: true });
 });
 
@@ -813,7 +907,6 @@ app.post('/api/coords/clear', (req, res) => {
             delete coordBuffer[session_id];
         }
 
-        console.log(`🧹 [清除座標] Session: ${session_id} 已清除 (${clearedCount} 筆座標)`);
         return res.status(200).json({ status: "ok", session_id: session_id, cleared: clearedCount });
     });
 });
@@ -829,7 +922,10 @@ app.post('/api/check-in', (req, res) => {
 
     const sql = 'INSERT INTO check_in (user_id, device_id, course_id) VALUES (?, ?, ?)';
     db.query(sql, [student_info, device_address, course_id], (err) => {
-        if (err) return res.status(500).json({ success: false, message: 'Database Error', error: err });
+        if (err) {
+            logSystemError('打卡寫入資料庫失敗', err, req);
+            return res.status(500).json({ success: false, message: 'Database Error', error: err });
+        }
         console.log(`✅ [點名成功] 學生 ${student_info} 已簽到課程 ID: ${course_id}`);
         res.status(200).json({ success: true, message: 'Success' });
     });
@@ -838,8 +934,8 @@ app.post('/api/check-in', (req, res) => {
 // 查詢出席狀態表格
 app.get('/api/session/attendance-status', (req, res) => {
     const course_id = req.query.course_id ? parseInt(req.query.course_id) : 1;
-
     const sqlCourseStudents = 'SELECT student_id, student_name FROM course_students WHERE course_id = ?';
+
     db.query(sqlCourseStudents, [course_id], (err, allStudents) => {
         const studentsList = (allStudents && allStudents.length > 0)
             ? allStudents.map(s => ({ id: s.student_id, name: s.student_name }))
@@ -863,18 +959,31 @@ app.get('/api/session/attendance-status', (req, res) => {
 });
 
 app.get('/api/users', (req, res) => {
-    db.query('SELECT user_id, name, email, device_id, role FROM user', (err, results) => {
-        res.json(results);
+    db.query('SELECT user_id, name, email, device_id, role, (password IS NOT NULL) AS is_registered FROM user', (err, results) => {
+        if (err) logSystemError('查詢使用者清單失敗', err, req);
+        res.json(results || []);
+    });
+});
+
+// ==========================================
+// 🚨 Express 全域未處理錯誤中介層
+// ==========================================
+app.use((err, req, res, next) => {
+    logSystemError('Express 路由未攔截錯誤 (500)', err, req);
+    res.status(500).json({
+        success: false,
+        message: '伺服器內部發生錯誤，已記錄至 error.log',
+        detail: err.message
     });
 });
 
 app.listen(3000, '0.0.0.0', () => {
     console.log('===========================================================');
-    console.log('🚀 藍牙防作弊點名系統 - 後端伺服器 (支援 App v6.1 課表同步版) 已啟動！');
+    console.log('🚀 藍牙防作弊點名系統 - 全功能整合版已啟動！');
     console.log('🌐 運行埠口: 3000');
-    console.log('🗓️ 支援課表雙向同步: /api/teacher/schedule/sync & /api/teacher/schedule/get');
-    console.log('🔓 學生裝置限制: 已完全解除 (任何裝置皆可登入)');
-    console.log('👥 預設修課名單: 5 位組員 (0305, 0615, 0596, 0651, 3033)');
-    console.log('👨‍🏫 全空白課表測試老師: newteacher@mail.mcu.edu.tw (密碼: teacher123)');
+    console.log('🔒 點名 OTP 模式: 全程固定靜態 OTP (已移除 30 秒自動更新)');
+    console.log('🗓️ 課表雙向同步: 支援同名課程自動標註 1、2');
+    console.log('👤 學生帳號: 匯入時預建帳號，密碼由學生親自註冊驗證後啟用');
+    console.log('📁 錯誤日誌自動寫入: ' + ERROR_LOG_PATH);
     console.log('===========================================================');
 });
